@@ -373,6 +373,11 @@ def _is_personal_trade_update(text: str) -> bool:
         ("TRAIL SL",),
         ("MAX PROFIT LOCK",),
         ("NEXT-DAY SWING",),
+        # Additional trading diagnostics
+        ("STRONG BREAKOUT",),
+        ("No Directional Setup",),
+        ("SCAN —",),
+        ("VIP END OF DAY SUMMARY",),
     )
 
     return any(

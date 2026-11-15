@@ -192,3 +192,4 @@ def validate_live_extras(
         "outlay_rupees": round(premium_outlay, 2),
         "required_cash": round(required_cash, 2),
     }
+
