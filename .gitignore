@@ -1,0 +1,139 @@
+
+# ==========================================
+# SECRETS AND ENVIRONMENT VARIABLES
+# ==========================================
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
+service-account*.json
+
+# ==========================================
+# PYTHON ENVIRONMENTS
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+.python-version
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ==========================================
+# PYTHON PACKAGING
+# ==========================================
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ==========================================
+# TESTING AND COVERAGE
+# ==========================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+junit.xml
+
+# ==========================================
+# EDITORS AND IDEs
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ==========================================
+# LOGS
+# ==========================================
+*.log
+logs/
+log/
+*.log.*
+collector.log
+banknifty_collector.log
+finnifty_collector.log
+sensex_collector.log
+
+# ==========================================
+# LOCAL DATABASES AND DATABASE BACKUPS
+# ==========================================
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.dump
+*.backup
+*.bak
+backups/
+database_backups/
+
+# ==========================================
+# MARKET DATA AND GENERATED SNAPSHOTS
+# ==========================================
+data/raw/
+data/processed/
+data/cache/
+data/live/
+data/snapshots/
+data/exports/
+data/tmp/
+*.parquet
+*.feather
+*.arrow
+
+# ==========================================
+# MODEL CHECKPOINTS AND GENERATED OUTPUT
+# ==========================================
+models/
+checkpoints/
+artifacts/
+outputs/
+*.pkl
+*.pickle
+*.joblib
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.model
+
+# ==========================================
+# TEMPORARY FILES
+# ==========================================
+*.tmp
+*.temp
+*.swp
+*.pid
+*.lock.tmp
+
+# ==========================================
+# LOCAL AUTOMATION AND DEBUG OUTPUT
+# ==========================================
+.DS_Store
+debug/
+tmp/
+temp/
+
+# ==========================================
+# OPTIONAL LOCAL CONFIGURATION
+# ==========================================
+config.local.*
+settings.local.*

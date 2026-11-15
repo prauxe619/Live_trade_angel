@@ -1,0 +1,29 @@
+TEST REPORT — CORRECTED SHARED MODULES
+
+Scope: five shared modules only. No collector files are included.
+
+Compilation:
+  PASS — collector_common.py
+  PASS — instrument_master_store.py
+  PASS — market_store.py
+  PASS — ohlcv_stream.py
+  PASS — shared_snapshots.py
+
+Mocked/local tests:
+  PASS — partial current-minute candle is not persisted during shutdown
+  PASS — completed prior-minute candle is persisted during shutdown
+  PASS — failed database publish retains pending candle queue
+  PASS — retry succeeds and clears pending candle queue
+  PASS — string/numeric boolean parsing
+  PASS — table initialization advisory-lock code present
+  PASS — SmartAPI import inside reconnect exception boundary
+
+External integration not tested:
+  NOT TESTED — Angel One login and live WebSocket
+  NOT TESTED — Railway PostgreSQL schema creation and inserts
+  NOT TESTED — concurrent startup of all four Railway services
+  NOT TESTED — live market session, network interruption and Railway restart
+
+Result:
+  Local/static/mock checks PASS.
+  Live-market readiness remains UNVERIFIED and requires integration testing.
