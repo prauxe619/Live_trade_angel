@@ -1,0 +1,15 @@
+# Copy values into /etc/live-trade-angel.env (never commit real credentials).
+# ec2_install.sh generates DATABASE_URL and safe paper-mode defaults.
+# Add the exact Angel One and Telegram variable names used by your current .env.
+# Do not paste credentials into GitHub or this template.
+
+MARKET_TIMEZONE=Asia/Kolkata
+SNAPSHOT_SOURCE=postgres
+SNAPSHOT_MAX_AGE_SECONDS=60
+OPTION_RETENTION_DAYS=0
+TRADING_MODE=paper
+TRADING_ENABLED=false
+ALLOW_ORDER_SUBMISSION=false
+LIVE_SHADOW=true
+PAPER_LEDGER_ENABLED=true
+DISABLE_SYSTEM_SHUTDOWN=true

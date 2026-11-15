@@ -1,5 +1,5 @@
 """
-Railway session supervisor for the four Angel One market-data collectors.
+EC2 session supervisor for the four Angel One market-data collectors.
 
 Run from the project root:
     python -u supervisor.py
@@ -74,7 +74,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [supervisor] %(message)s",
     stream=sys.stdout,
 )
-log = logging.getLogger("railway_supervisor")
+log = logging.getLogger("ec2_supervisor")
 
 
 
@@ -298,7 +298,7 @@ def stop_process(name: str, proc: subprocess.Popen) -> None:
 
 
 def main() -> int:
-    log.info("Railway collector supervisor started; timezone=%s", TZ)
+    log.info("EC2 collector supervisor started; timezone=%s", TZ)
     log.info(
         "Signal engine trading config: mode=%s enabled=%s allow_submit=%s shadow=%s ack_present=%s; "
         "collectors are forced to paper mode. No host shutdown will be issued.",

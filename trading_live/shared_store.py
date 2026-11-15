@@ -1,4 +1,4 @@
-"""PostgreSQL handoff for snapshots between separate Railway services."""
+"""PostgreSQL handoff for snapshots between separate EC2 services."""
 from __future__ import annotations
 import json, os, time
 from typing import Any

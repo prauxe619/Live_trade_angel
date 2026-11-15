@@ -36,7 +36,7 @@ IST = ZoneInfo("Asia/Kolkata")
 _SNAPSHOT_TABLE_READY = False
 _CANDLE_TABLE_READY = False
 
-# Separate transaction-scoped locks prevent concurrent Railway services from
+# Separate transaction-scoped locks prevent concurrent EC2 services from
 # racing while creating the two shared tables.
 _SNAPSHOT_SCHEMA_LOCK = 727101
 _CANDLE_SCHEMA_LOCK = 727102

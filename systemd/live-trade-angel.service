@@ -1,0 +1,23 @@
+[Unit]
+Description=Angel One Nifty AI Trader - EC2 Supervisor
+Wants=network-online.target postgresql.service
+After=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/live-trade-angel/app
+EnvironmentFile=/etc/live-trade-angel.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/live-trade-angel/app/.venv/bin/python -u /opt/live-trade-angel/app/supervisor.py
+Restart=on-failure
+RestartSec=15
+KillMode=mixed
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -47,7 +47,7 @@ def safe_number(value, default=0.0):
     except (TypeError, ValueError, OverflowError):
         return default
 
-# Ensure repo root is importable when launched as a Railway script
+# Ensure repo root is importable when launched by the EC2 supervisor
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from collectors.scripts.shared_snapshots import (
     init_snapshot_table,
@@ -57,7 +57,7 @@ from collectors.scripts import market_store
 from collectors.scripts.ohlcv_stream import start_index_stream
 from collectors.scripts.shared_snapshots import get_recent_candles as get_ohlcv_candles
 
-# Ensure repo root is importable when launched as a Railway script
+# Ensure repo root is importable when launched by the EC2 supervisor
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # Make console output safe for emojis on Windows terminals
@@ -89,7 +89,7 @@ CONFIG = {
     # Resilience
     "MAX_RETRIES"     : 5,
     "RETRY_DELAY"     : 10,
-    # OS shutdown is intentionally unsupported; Railway manages service lifecycle.
+    # OS shutdown is intentionally unsupported; EC2 manages service lifecycle.
 
     # Data Quality
     "MIN_OPTIONS_PER_TICK" : 20,   # Alert if fewer rows collected
@@ -134,7 +134,7 @@ class DateTimeEncoder(json.JSONEncoder):
 def run_closed_market_shutdown_sequence():
     """Run optional data validation on a closed day; never shut down the host.
 
-    Railway owns the worker lifecycle. This function must not invoke OS power
+    EC2 owns the worker lifecycle. This function must not invoke OS power
     commands, regardless of environment variables or platform.
     """
     logger.info("Market is closed. Running validation; host shutdown is disabled.")
@@ -154,7 +154,7 @@ def run_closed_market_shutdown_sequence():
 
 
 def _local_snapshot_enabled() -> bool:
-    """Local data/live/*.json snapshot files are OFF by default: Railway's disk is ephemeral and the
+    """Local data/live/*.json snapshot files are OFF by default: EC2 storage is persistent but still requires independent backups and the
     snapshot is already published to PostgreSQL. Set WRITE_LOCAL_SNAPSHOT=true to also write the file."""
     return os.getenv("WRITE_LOCAL_SNAPSHOT", "false").strip().lower() in ("1", "true", "yes")
 
@@ -271,7 +271,7 @@ class InstitutionalCollector:
         Path("data/live").mkdir(parents=True, exist_ok=True)
         import atexit
         atexit.register(lambda: getattr(self, "ohlcv_stream", None) and self.ohlcv_stream.stop())
-        # Last-chance flush if the process exits (market close, crash, or Railway SIGTERM on redeploy).
+        # Last-chance flush if the process exits (market close, crash, or SIGTERM during a service restart or shutdown).
         import atexit, signal
         atexit.register(self._flush_before_exit)
         try:
@@ -1169,10 +1169,10 @@ class InstitutionalCollector:
     def _system_shutdown(self):
         """Compatibility stub: host shutdown is intentionally disabled.
 
-        Railway controls service lifecycle; this collector must never power off
+        EC2 controls service lifecycle; this collector must never power off
         the host running it.
         """
-        logger.warning("OS shutdown is disabled; Railway manages worker lifecycle.")
+        logger.warning("OS shutdown is disabled; EC2 manages worker lifecycle.")
 
     def perform_shutdown_sequence(self):
         logger.info("Running daily validation...")
@@ -1186,7 +1186,7 @@ class InstitutionalCollector:
         except Exception as e:
             logger.error(f"Validation error: {e}")
 
-        # Never power off the host. Railway (or the local OS) manages process
+        # Never power off the host. EC2 (or the local OS) manages process
         # lifecycle; the collector only saves data and exits its collection loop.
         if self.manual_stop:
             shutdown_line = "Manual stop - host shutdown disabled."
@@ -1280,7 +1280,7 @@ class InstitutionalCollector:
             f"📡 Greeks: 14-metric suite\n"
             f"⚡ GEX Walls + IV Surface: ACTIVE\n"
             f"📊 Futures Basis + Realized Vol + Max Pain + Regime: ACTIVE\n"
-            f"⏻ Host shutdown: DISABLED (Railway-safe)"
+            f"⏻ Host shutdown: DISABLED (EC2-safe)"
         )
 
         if datetime.now(CONFIG["TZ"]).weekday() >= 5:

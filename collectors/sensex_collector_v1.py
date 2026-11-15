@@ -118,7 +118,7 @@ class DateTimeEncoder(json.JSONEncoder):
 
 
 def _local_snapshot_enabled() -> bool:
-    """Local data/live/*.json snapshot files are OFF by default: Railway's disk is ephemeral and the
+    """Local data/live/*.json snapshot files are OFF by default: EC2 storage is persistent but still requires independent backups and the
     snapshot is already published to PostgreSQL. Set WRITE_LOCAL_SNAPSHOT=true to also write the file."""
     return os.getenv("WRITE_LOCAL_SNAPSHOT", "false").strip().lower() in ("1", "true", "yes")
 
@@ -236,7 +236,7 @@ class SensexCollector:
         Path("data/live").mkdir(parents=True, exist_ok=True)
         import atexit
         atexit.register(lambda: getattr(self, "ohlcv_stream", None) and self.ohlcv_stream.stop())
-        # Last-chance flush if the process exits (market close, crash, or Railway SIGTERM on redeploy).
+        # Last-chance flush if the process exits (market close, crash, or SIGTERM during a service restart or shutdown).
         import atexit, signal
         atexit.register(self._flush_before_exit)
         try:

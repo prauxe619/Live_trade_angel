@@ -3,7 +3,7 @@
 Architecture:
 - First collector to request today's master downloads and publishes it.
 - NIFTY, BANKNIFTY, FINNIFTY and SENSEX read the same PostgreSQL row.
-- A PostgreSQL session advisory lock serializes refreshes across Railway services.
+- A PostgreSQL session advisory lock serializes refreshes across EC2 services.
 - A collector rechecks PostgreSQL after acquiring the lock, so only one download
   occurs when multiple collectors start together.
 - Missing, invalid, checksum-mismatched or wrong-date data is never returned.
@@ -11,7 +11,7 @@ Architecture:
 
 Database configuration:
 - Uses the same connection helper as collectors/scripts/market_store.py.
-- Railway: DATABASE_URL
+- EC2: DATABASE_URL
 - Local development: USE_LOCAL_DATABASE=true and LOCAL_DATABASE_URL
 
 Dependencies:

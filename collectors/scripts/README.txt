@@ -20,7 +20,7 @@ Important fixes applied in this package:
 3. OHLCV persistence calls are serialized to prevent concurrent callbacks from
    racing while submitting and removing the pending queue prefix.
 4. Snapshot and OHLCV table initialization use separate PostgreSQL transaction
-   advisory locks to serialize first-time setup across Railway services.
+   advisory locks to serialize first-time setup across EC2 services.
 5. market_store boolean conversion explicitly parses true/false strings and
    does not convert the string "false" to True.
 
@@ -49,8 +49,8 @@ Validation performed in this environment:
 
 Not performed:
   - Live Angel One authentication or WebSocket subscription.
-  - Live Railway/PostgreSQL DDL, writes, read-back, or multi-service race test.
-  - Full trading-session test or Railway restart test.
+  - Live EC2/PostgreSQL DDL, writes, read-back, or multi-service race test.
+  - Full trading-session test or EC2 restart test.
 
 Therefore this package has passed local/static and mocked checks, but it is not
 certified crash-free in a live market until deployed and integration-tested.

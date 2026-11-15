@@ -1,21 +1,21 @@
 """PostgreSQL persistence for collector option rows and candles.
 
-Replaces the local parquet files (which vanish on every Railway redeploy).
+Replaces the local parquet files (which are not a substitute for durable database storage).
 Uses the same env switch as the rest of the project:
-    DATABASE_URL                         (Railway Postgres; default)
+    DATABASE_URL                         (EC2 Postgres; default)
     USE_LOCAL_DATABASE=true + LOCAL_DATABASE_URL   (local development)
 
 Design notes
   * Every insert is idempotent (PRIMARY KEY + ON CONFLICT DO NOTHING), so a restart or a retried
     batch can never create duplicate rows.
   * Connections are short-lived (one per write). Nothing is held open across the 60-second tick,
-    so a dropped Railway connection can't poison the collector.
+    so a dropped EC2 connection can't poison the collector.
   * Schema creation takes an advisory lock, so four collectors starting at the same second don't race.
   * NaN/inf are converted to NULL/None before they reach JSONB (Postgres rejects NaN in JSON).
   * Rows are stored in typed columns (about 0.5 KB/row) rather than JSONB (about 1.3 KB/row). Any
     field a collector adds in future that has no column yet is kept in the `extra` JSONB column.
-  * Old rows are purged after OPTION_RETENTION_DAYS (default 14; 0 = keep forever). A full Railway
-    volume crashes Postgres, which would also take the live snapshot table down with it.
+  * Old rows are purged after OPTION_RETENTION_DAYS (default 14; 0 = keep forever). A full EC2
+    volume can stop Postgres, which would also take the live snapshot table down with it.
 """
 from __future__ import annotations
 
@@ -76,7 +76,7 @@ def _db_url() -> str:
     use_local = os.getenv("USE_LOCAL_DATABASE", "").strip().lower() in ("1", "true", "yes")
     url = os.getenv("LOCAL_DATABASE_URL" if use_local else "DATABASE_URL", "").strip()
     if not url:
-        raise RuntimeError("DATABASE_URL is not set (add the Railway Postgres reference variable)")
+        raise RuntimeError("DATABASE_URL is not set (add the EC2 Postgres reference variable)")
     return url
 
 
@@ -125,12 +125,20 @@ def _num(v: Any):
 
 
 def _bool(v: Any):
+    """Convert database-bound boolean values without treating the string 'false' as True."""
     if v is None:
         return None
-    try:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
         return bool(v)
-    except Exception:
-        return None
+    if isinstance(v, str):
+        value = v.strip().lower()
+        if value in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if value in {"0", "false", "f", "no", "n", "off", ""}:
+            return False
+    return None
 
 
 def _text(v: Any):
