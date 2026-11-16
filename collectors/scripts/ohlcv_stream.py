@@ -45,8 +45,10 @@ def _as_ist_minute(value):
     return dt.replace(second=0, microsecond=0)
 
 
+
 class MinuteOHLCVAggregator:
-    """Aggregates ordered price ticks; never fabricates missing minutes or volume."""
+    """Aggregates price ticks and optional genuine traded-volume deltas."""
+
     def __init__(self, symbol: str, publisher=None, on_price=None,
                  source="angelone_websocket_index_spot"):
         self.symbol = str(symbol).upper()
@@ -58,54 +60,81 @@ class MinuteOHLCVAggregator:
         self.pending = []
         self.last_persist_attempt = 0.0
 
-    def add_tick(self, price, timestamp=None):
+    def add_tick(self, price, timestamp=None, volume_delta=None):
         try:
             price = float(price)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
+
         if not math.isfinite(price) or price <= 0:
             return None
+
+        if volume_delta is not None:
+            try:
+                volume_delta = float(volume_delta)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if not math.isfinite(volume_delta) or volume_delta < 0:
+                return None
+
         try:
             minute = _as_ist_minute(timestamp)
         except ValueError as exc:
             logger.warning("%s rejected tick timestamp: %s", self.symbol, exc)
             return None
+
         closed = None
+
         with self.lock:
             current = self.current
+
             if current is None:
-                self.current = self._new_bar(minute, price)
-                self.current["source"] = self.source
+                self.current = self._new_bar(minute, price, volume_delta)
+
             elif minute < current["_minute"]:
-                # Ignore out-of-order packets; they must not corrupt an already
-                # accumulated or completed candle.
                 return None
+
             elif minute == current["_minute"]:
                 current["high"] = max(current["high"], price)
                 current["low"] = min(current["low"], price)
                 current["close"] = price
                 current["tick_count"] += 1
+
+                if volume_delta is not None:
+                    if current["volume"] is None:
+                        current["volume"] = 0.0
+                    current["volume"] += volume_delta
+
             else:
                 closed = self._public_bar(current)
                 self.pending.append(closed)
-                self.current = self._new_bar(minute, price)
-                self.current["source"] = self.source
+                self.current = self._new_bar(minute, price, volume_delta)
+
         if self.on_price:
             try:
                 self.on_price(price, timestamp or datetime.now(IST))
             except Exception:
                 logger.exception("%s on_price callback failed", self.symbol)
+
         if closed:
             self._try_persist()
         else:
             self._try_persist_pending()
+
         return closed
 
-    @staticmethod
-    def _new_bar(minute, price):
-        return {"_minute": minute, "timestamp": minute.isoformat(), "open": price,
-                "high": price, "low": price, "close": price, "volume": None,
-                "source": "angelone_websocket_index_spot", "tick_count": 1}
+    def _new_bar(self, minute, price, volume_delta=None):
+        return {
+            "_minute": minute,
+            "timestamp": minute.isoformat(),
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
+            "volume": None if volume_delta is None else float(volume_delta),
+            "source": self.source,
+            "tick_count": 1,
+        }
 
     @staticmethod
     def _public_bar(bar):
@@ -113,49 +142,59 @@ class MinuteOHLCVAggregator:
         public["is_complete"] = True
         public["tick_count"] = int(public.get("tick_count") or 0)
         public["quality_status"] = (
-            "VALID" if public["tick_count"] >= 3 else "INVALID_LOW_TICK_COUNT"
+            "VALID" if public["tick_count"] >= 3
+            else "INVALID_LOW_TICK_COUNT"
         )
         return public
 
     def flush(self):
-        """Persist completed bars only; discard the currently forming partial bar."""
+        """Persist completed bars; discard the forming candle."""
         with self.lock:
             if self.current is not None:
                 logger.info(
-                    "%s discarding incomplete shutdown candle %s (ticks=%s)",
+                    "%s discarding incomplete shutdown candle %s",
                     self.symbol,
                     self.current.get("timestamp"),
-                    self.current.get("tick_count"),
                 )
                 self.current = None
+
         self._try_persist_pending(force=True)
+
         with self.lock:
             return len(self.pending) == 0
 
     def _try_persist(self):
-        if not self.publisher:
-            return
-        self._try_persist_pending(force=True)
+        if self.publisher:
+            self._try_persist_pending(force=True)
 
     def _try_persist_pending(self, force=False):
         if not self.publisher:
             return
+
         now = time.monotonic()
+
         with self.lock:
-            if not self.pending or (not force and now - self.last_persist_attempt < 10):
+            if not self.pending:
+                return
+            if not force and now - self.last_persist_attempt < 10:
                 return
             batch = list(self.pending)
             self.last_persist_attempt = now
+
         try:
             self.publisher(self.symbol, batch, strict=True)
             with self.lock:
-                # Drop only the exact batch that was submitted. New bars may have
-                # arrived while the DB call was in progress.
                 del self.pending[:len(batch)]
-            logger.info("%s persisted %d closed WebSocket candle(s)", self.symbol, len(batch))
+            logger.info(
+                "%s persisted %d completed candle(s)",
+                self.symbol, len(batch)
+            )
         except Exception as exc:
-            logger.warning("%s candle persistence failed; %d bars queued: %s",
-                           self.symbol, len(batch), exc)
+            logger.warning(
+                "%s candle persistence failed; %d bars queued: %s",
+                self.symbol, len(batch), exc
+            )
+
 
 
 class AngelOneIndexOHLCVStream:
@@ -183,6 +222,16 @@ class AngelOneIndexOHLCVStream:
         self.option_lock = threading.RLock()
         self.option_refresh_thread = None
         self._option_master_cache = None
+
+        self.futures_token = None
+        self.futures_expiry = None
+        self.futures_exchange_type = None
+        self.futures_aggregator = None
+        self.futures_lock = threading.RLock()
+        self._last_futures_cumulative_volume = None
+        self._last_futures_timestamp = None
+        self._ws_open = False
+
 
     @staticmethod
     def _publish_candles(symbol, rows, strict=False):
@@ -215,6 +264,12 @@ class AngelOneIndexOHLCVStream:
                 and self.option_refresh_thread is not threading.current_thread()):
             self.option_refresh_thread.join(timeout=max(0.0, float(join_timeout)))
         flushed = self.aggregator.flush()
+        with self.futures_lock:
+            futures_aggregator = self.futures_aggregator
+
+        futures_flushed = True
+        if futures_aggregator is not None:
+            futures_flushed = futures_aggregator.flush()
         with self.option_lock:
             option_aggregators = list(self.option_aggregators.values())
         for option_aggregator in option_aggregators:
@@ -235,6 +290,11 @@ class AngelOneIndexOHLCVStream:
         if not flushed:
             logger.critical("%s OHLCV shutdown flush incomplete; %d candle(s) remain queued",
                             self.symbol, len(self.aggregator.pending))
+        if not futures_flushed:
+            logger.critical(
+                "%s futures OHLCV shutdown flush incomplete",
+                self.symbol
+            )
 
     def update_credentials(self, jwt_token, feed_token):
         """Swap in fresh tokens (e.g. after the collector's 09:14 reconnect) and
@@ -250,6 +310,83 @@ class AngelOneIndexOHLCVStream:
             except Exception:
                 pass
         logger.info("%s WebSocket credentials refreshed; reconnecting", self.symbol)
+
+    
+    def set_futures_contract(self, token, exchange_type, expiry):
+        """Configure the active futures contract and subscribe in SNAP_QUOTE mode."""
+
+        token = str(token).strip()
+        if not token:
+            raise ValueError("Futures token cannot be empty")
+
+        expiry = str(expiry)[:10]
+
+        with self.futures_lock:
+            if self.futures_token == token and self.futures_aggregator is not None:
+                return
+
+            self.futures_token = token
+            self.futures_expiry = expiry
+            self.futures_exchange_type = int(exchange_type)
+            self._last_futures_cumulative_volume = None
+            self._last_futures_timestamp = None
+
+            self.futures_aggregator = MinuteOHLCVAggregator(
+                f"{self.symbol}:FUTURES",
+                publisher=lambda _symbol, rows, strict=False,
+                    tok=token, exp=expiry:
+                    self._publish_futures_candles(tok, exp, rows),
+                source="angelone_websocket_futures_snap_quote",
+            )
+
+        logger.info(
+            "%s futures contract configured token=%s expiry=%s exchange_type=%s",
+            self.symbol, token, expiry, exchange_type
+        )
+
+        if self._ws_open:
+            self._subscribe_futures()
+
+    def _subscribe_futures(self):
+        ws = self.ws
+
+        with self.futures_lock:
+            token = self.futures_token
+            exchange_type = self.futures_exchange_type
+
+        if ws is None or not self._ws_open or not token or exchange_type is None:
+            return
+
+        try:
+            ws.subscribe(
+                f"{self.symbol.lower()}-fut",
+                3,
+                [{
+                    "exchangeType": int(exchange_type),
+                    "tokens": [str(token)],
+                }],
+            )
+            logger.info(
+                "%s futures SNAP_QUOTE subscribed token=%s",
+                self.symbol, token
+            )
+        except Exception:
+            logger.exception(
+                "%s futures WebSocket subscription failed",
+                self.symbol
+            )
+
+    def _publish_futures_candles(self, token, expiry, rows):
+        from collectors.scripts.shared_snapshots import publish_futures_candles
+
+        return publish_futures_candles(
+            self.symbol,
+            token,
+            expiry,
+            rows,
+            strict=True,
+        )
+
 
     
     def _run(self):
@@ -289,6 +426,8 @@ class AngelOneIndexOHLCVStream:
                    )
    
                    self._subscribe_all_option_tokens(ws)
+                   self._ws_open = True
+                   self._subscribe_futures()
 
                def on_data(wsapp, message):
                    self._on_data(message)
@@ -300,6 +439,7 @@ class AngelOneIndexOHLCVStream:
                    )
    
                def on_close(wsapp):
+                   self._ws_open = False
                    logger.warning(
                        "%s WebSocket closed",
                        self.symbol
@@ -309,6 +449,7 @@ class AngelOneIndexOHLCVStream:
                ws.on_data = on_data
                ws.on_error = on_error
                ws.on_close = on_close
+               self._ws_open = False
    
                ws.connect()
    
@@ -320,6 +461,7 @@ class AngelOneIndexOHLCVStream:
                    )
    
            finally:
+               self._ws_open = False
                self.ws = None
    
            if not self.stop_event.is_set():
@@ -349,53 +491,141 @@ class AngelOneIndexOHLCVStream:
             return best
         return candidates[0]                              # no REST spot yet: trust the divisor
 
+    
     def _on_data(self, message):
         if isinstance(message, str):
             try:
                 message = json.loads(message)
             except json.JSONDecodeError:
                 return
+
         if not isinstance(message, dict):
             return
+
         raw_token = message.get("token")
         if raw_token is None or not str(raw_token).strip():
             return
+
         tick_token = str(raw_token).split("-")[0]
-        raw_price = message.get("last_traded_price")
+
         try:
-            raw_price = float(raw_price if raw_price is not None
-                              else message.get("ltp", message.get("lastPrice")))
-        except (TypeError, ValueError):
-            return
-        timestamp = None
-        raw_ts = message.get("exchange_timestamp") or message.get("exchangeTimestamp")
-        if raw_ts is not None:
-            try:
-                numeric_ts = float(raw_ts)
-                if numeric_ts > 1e12:
-                    numeric_ts /= 1000.0
-                timestamp = datetime.fromtimestamp(
-                    numeric_ts, tz=timezone.utc
-                ).astimezone(IST)
-            except (TypeError, ValueError, OSError, OverflowError):
-                timestamp = None
-        if timestamp is None:
-            logger.warning("%s rejected tick with missing/invalid exchange timestamp", self.symbol)
+            raw_price = float(
+                message.get(
+                    "last_traded_price",
+                    message.get("ltp", message.get("lastPrice"))
+                )
+            )
+        except (TypeError, ValueError, OverflowError):
             return
 
+        raw_ts = message.get("exchange_timestamp") or message.get("exchangeTimestamp")
+        if raw_ts is None:
+            logger.warning(
+                "%s rejected tick with missing exchange timestamp",
+                self.symbol
+            )
+            return
+
+        try:
+            numeric_ts = float(raw_ts)
+            if numeric_ts > 1e12:
+                numeric_ts /= 1000.0
+
+            timestamp = datetime.fromtimestamp(
+                numeric_ts, tz=timezone.utc
+            ).astimezone(IST)
+        except (TypeError, ValueError, OSError, OverflowError):
+            return
+
+        # ----------------------------------------------------------
+        # FUTURES: SNAP_QUOTE mode, cumulative daily traded volume.
+        # ----------------------------------------------------------
+        with self.futures_lock:
+            futures_token = self.futures_token
+            futures_aggregator = self.futures_aggregator
+
+        if tick_token == futures_token and futures_aggregator is not None:
+            try:
+                cumulative = float(message["volume_trade_for_the_day"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                logger.warning(
+                    "%s futures tick missing cumulative traded volume",
+                    self.symbol
+                )
+                return
+
+            if not math.isfinite(cumulative) or cumulative < 0:
+                return
+
+            with self.futures_lock:
+                previous = self._last_futures_cumulative_volume
+                previous_ts = self._last_futures_timestamp
+
+                if previous_ts is not None and timestamp < previous_ts:
+                    return
+
+                if previous is None:
+                    # Establish baseline; do not incorrectly count the whole
+                    # day's accumulated volume as this minute's volume.
+                    volume_delta = 0.0
+                elif (timestamp - previous_ts).total_seconds() > 90:
+                    # A reconnect gap can contain many minutes of cumulative
+                    # volume. Re-baseline instead of assigning that whole
+                    # amount to the first post-reconnect candle.
+                    logger.warning(
+                        "%s futures volume baseline reset after %.1fs tick gap",
+                        self.symbol, (timestamp - previous_ts).total_seconds()
+                    )
+                    volume_delta = 0.0
+                elif cumulative >= previous:
+                    volume_delta = cumulative - previous
+                else:
+                    # Cumulative-volume reset: establish a new baseline.
+                    logger.warning(
+                        "%s futures cumulative volume reset: %.0f -> %.0f",
+                        self.symbol, previous, cumulative
+                    )
+                    volume_delta = 0.0
+
+                self._last_futures_cumulative_volume = cumulative
+                self._last_futures_timestamp = timestamp
+
+            price = raw_price / 100.0
+
+            if math.isfinite(price) and price > 0:
+                futures_aggregator.add_tick(
+                    price,
+                    timestamp,
+                    volume_delta=volume_delta,
+                )
+
+            return
+
+        # ----------------------------------------------------------
+        # SPOT INDEX: existing LTP stream; no traded volume.
+        # ----------------------------------------------------------
         if tick_token == self.token:
             price = self._to_rupees(raw_price)
+
             if price is not None and price > 0:
                 self.aggregator.add_tick(price, timestamp)
+
             return
 
+        # ----------------------------------------------------------
+        # OPTIONS: existing option LTP candle stream.
+        # ----------------------------------------------------------
         with self.option_lock:
             option_aggregator = self.option_aggregators.get(tick_token)
+
         if option_aggregator is None:
             return
+
         option_price = raw_price / 100.0
+
         if math.isfinite(option_price) and option_price > 0:
             option_aggregator.add_tick(option_price, timestamp)
+
 
     def _publish_option_candles(self, token, rows):
         from collectors.scripts import market_store

@@ -1233,7 +1233,7 @@ class InstitutionalCollector:
         vix_token = str(vix_rows.iloc[0]["token"])
         today_date = datetime.now(CONFIG["TZ"]).date()
         fut_rows["parsed_exp"] = pd.to_datetime(
-            fut_rows["expiry"], errors="coerce"
+            fut_rows["expiry"], errors="coerce", dayfirst=True, format="mixed"
         ).dt.date
         # Select the nearest non-expired futures contract only.
         fut_rows = (
@@ -1244,6 +1244,14 @@ class InstitutionalCollector:
         if fut_rows.empty:
             raise RuntimeError('No active NIFTY futures contract found in instrument master.')
         nifty_fut_token = str(fut_rows.iloc[0]['token'])
+        nifty_fut_expiry = fut_rows.iloc[0]["parsed_exp"].isoformat()
+
+        if self.ohlcv_stream is not None:
+            self.ohlcv_stream.set_futures_contract(
+                nifty_fut_token,
+                exchange_type=2,
+                expiry=nifty_fut_expiry,
+            )
 
         # -- Dynamic lot size --
         try:
@@ -1304,8 +1312,12 @@ class InstitutionalCollector:
                     and self._reconnected_today != self.today
                 ):
                     logger.info("Pre-market session reconnect.")
-                    self.connect()
-                    self._reconnected_today = self.today
+                    if self.connect():
+                        if self.ohlcv_stream is not None:
+                            self.ohlcv_stream.update_credentials(self.jwt_token, self.feed_token)
+                        self._reconnected_today = self.today
+                    else:
+                        logger.error("Pre-market reconnect failed; retaining current WebSocket credentials.")
 
                 if now_str < CONFIG["MARKET_OPEN"]:
                     logger.info(f"Waiting for market open ({CONFIG['MARKET_OPEN']})...")

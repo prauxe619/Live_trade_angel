@@ -1128,12 +1128,13 @@ class BankNiftyCollector:
             vix_token = str(vix_rows.iloc[0]['token'])
 
         fut_rows = master.query("name=='BANKNIFTY' and exch_seg=='NFO' and instrumenttype=='FUTIDX'").copy()
+        bn_fut_expiry = None
         if fut_rows.empty:
             logger.warning("[BN] BANKNIFTY futures not found; futures basis will fall back to spot.")
             bn_fut_token = None
         else:
             fut_rows["parsed_exp"] = pd.to_datetime(
-                fut_rows["expiry"], errors="coerce"
+                fut_rows["expiry"], errors="coerce", dayfirst=True, format="mixed"
             ).dt.date
             # --- FIX: Trust Angel One's reality, ignore the system clock ---
             today_ist = datetime.now(CONFIG["TZ"]).date()
@@ -1143,7 +1144,15 @@ class BankNiftyCollector:
                 logger.warning("[BN] No active BANKNIFTY futures found for today or later; falling back to spot.")
                 bn_fut_token = None
             else:
-                bn_fut_token = str(valid_futs.iloc[0]['token'])
+                bn_fut_token = str(valid_futs.iloc[0]["token"])
+                bn_fut_expiry = valid_futs.iloc[0]["parsed_exp"].isoformat()
+
+        if self.ohlcv_stream is not None and bn_fut_token and bn_fut_expiry:
+            self.ohlcv_stream.set_futures_contract(
+                bn_fut_token, exchange_type=2, expiry=bn_fut_expiry
+            )
+        else:
+            logger.warning("[BN] Futures WebSocket volume stream unavailable; breakout volume confirmation will fail closed.")
 
         # -- BankNifty option chain from NFO --
         nfo = master.query(
@@ -1215,8 +1224,12 @@ class BankNiftyCollector:
                     and self._reconnected_today != self.today
                 ):
                     logger.info("[BN] Pre-market session reconnect.")
-                    self.connect()
-                    self._reconnected_today = self.today
+                    if self.connect():
+                        if self.ohlcv_stream is not None:
+                            self.ohlcv_stream.update_credentials(self.jwt_token, self.feed_token)
+                        self._reconnected_today = self.today
+                    else:
+                        logger.error("[BN] Pre-market reconnect failed; retaining current WebSocket credentials.")
 
                 if now_str < CONFIG["MARKET_OPEN"]:
                     logger.info(f"[BN] Waiting for market open ({CONFIG['MARKET_OPEN']})...")

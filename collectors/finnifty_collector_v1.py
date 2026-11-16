@@ -297,9 +297,10 @@ class FinNiftyCollector:
             try:
                 logger.info(f"Connecting to Angel One (attempt {attempt+1})...")
                 try:
+                    token_script = Path(__file__).resolve().parents[1] / "scripts" / "auto_refresh_tokens.py"
                     subprocess.run(
-                        [sys.executable, "scripts/auto_refresh_tokens.py"],
-                        check=True, timeout=30
+                        [sys.executable, str(token_script), "--account", "C"],
+                        check=True, timeout=30, cwd=str(Path(__file__).resolve().parents[1])
                     )
                     logger.info("Tokens refreshed.")
                 except Exception as e:
@@ -1162,12 +1163,13 @@ class FinNiftyCollector:
             logger.warning("[FN] INDIA VIX token missing; using last valid/default VIX.")
 
         fut_rows = master.query("name=='FINNIFTY' and exch_seg=='NFO' and instrumenttype=='FUTIDX'").copy()
+        fn_fut_expiry = None
         if fut_rows.empty:
             logger.warning("[FN] FINNIFTY futures not found; futures basis will fall back to spot.")
             fn_fut_token = None
         else:
             fut_rows["parsed_exp"] = pd.to_datetime(
-                fut_rows["expiry"], errors="coerce"
+                fut_rows["expiry"], errors="coerce", dayfirst=True, format="mixed"
             ).dt.date
             # --- FIX: Trust Angel One's reality, ignore the system clock ---
             # --- FIX: Trust Angel One's reality, ignore the system clock ---
@@ -1179,6 +1181,14 @@ class FinNiftyCollector:
                 fn_fut_token = None
             else:
                 fn_fut_token = str(valid_futs.iloc[0]['token'])
+                fn_fut_expiry = valid_futs.iloc[0]["parsed_exp"].isoformat()
+
+        if self.ohlcv_stream is not None and fn_fut_token and fn_fut_expiry:
+            self.ohlcv_stream.set_futures_contract(
+                fn_fut_token, exchange_type=2, expiry=fn_fut_expiry
+            )
+        else:
+            logger.warning("[FN] Futures WebSocket volume stream unavailable; breakout volume confirmation will fail closed.")
 
         # ── FinNifty option chain from NFO ────────────────────────────
         nfo = master.query(
@@ -1246,10 +1256,14 @@ class FinNiftyCollector:
                     logger.info("Weekend. Exiting.")
                     break
 
-                if now.hour == 9 and now.minute == 14 and self._reconnected_today != now.date():
+                if now.hour == 9 and now.minute == 14 and self._reconnected_today != self.today:
                     logger.info("[FN] Pre-market session reconnect.")
                     if self.connect():
-                        self._reconnected_today = now.date()
+                        if self.ohlcv_stream is not None:
+                            self.ohlcv_stream.update_credentials(self.jwt_token, self.feed_token)
+                        self._reconnected_today = self.today
+                    else:
+                        logger.error("[FN] Pre-market reconnect failed; retaining current WebSocket credentials.")
 
                 if now_str < CONFIG["MARKET_OPEN"]:
                     logger.info(f"[FN] Waiting for market open ({CONFIG['MARKET_OPEN']})...")

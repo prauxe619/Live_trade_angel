@@ -35,6 +35,11 @@ IST = ZoneInfo("Asia/Kolkata")
 
 _SNAPSHOT_TABLE_READY = False
 _CANDLE_TABLE_READY = False
+_FUTURES_CANDLE_TABLE_READY = False
+
+_SNAPSHOT_SCHEMA_LOCK = 727101
+_CANDLE_SCHEMA_LOCK = 727102
+_FUTURES_CANDLE_SCHEMA_LOCK = 727103
 
 # Separate transaction-scoped locks prevent concurrent EC2 services from
 # racing while creating the two shared tables.
@@ -445,6 +450,283 @@ def publish_candles(
                 inserted += max(cur.rowcount, 0)
 
     return inserted
+
+
+def init_futures_candle_table() -> None:
+    """Create the separate futures OHLCV table."""
+    global _FUTURES_CANDLE_TABLE_READY
+
+    if _FUTURES_CANDLE_TABLE_READY:
+        return
+
+    with _connect() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_FUTURES_CANDLE_SCHEMA_LOCK,))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS market_futures_ohlcv_candles (
+                symbol TEXT NOT NULL,
+                token TEXT NOT NULL,
+                expiry DATE NOT NULL,
+                ts TIMESTAMPTZ NOT NULL,
+                trade_date DATE NOT NULL,
+                open DOUBLE PRECISION NOT NULL,
+                high DOUBLE PRECISION NOT NULL,
+                low DOUBLE PRECISION NOT NULL,
+                close DOUBLE PRECISION NOT NULL,
+                volume DOUBLE PRECISION NOT NULL,
+                source TEXT NOT NULL,
+                tick_count INTEGER NOT NULL DEFAULT 0,
+                is_complete BOOLEAN NOT NULL DEFAULT FALSE,
+                quality_status TEXT NOT NULL DEFAULT 'LEGACY_UNVERIFIED',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+                PRIMARY KEY (symbol, token, ts),
+
+                CHECK (open > 0),
+                CHECK (high > 0),
+                CHECK (low > 0),
+                CHECK (close > 0),
+                CHECK (high >= low),
+                CHECK (high >= open AND high >= close),
+                CHECK (low <= open AND low <= close),
+                CHECK (volume >= 0)
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS market_futures_ohlcv_day_idx
+            ON market_futures_ohlcv_candles (symbol, trade_date, ts DESC)
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS market_futures_ohlcv_contract_idx
+            ON market_futures_ohlcv_candles (symbol, token, expiry, ts DESC)
+        """)
+
+    _FUTURES_CANDLE_TABLE_READY = True
+
+
+def publish_futures_candles(
+    symbol: str,
+    token: str,
+    expiry: str,
+    candles: Iterable[dict],
+    *,
+    strict: bool = True,
+) -> int:
+    """Persist completed futures candles with genuine traded volume."""
+
+    key = _normalise_symbol(symbol)
+    token = str(token).strip()
+
+    if not token:
+        raise ValueError("Futures token cannot be empty")
+
+    expiry_date = date.fromisoformat(str(expiry)[:10])
+
+    prepared = []
+
+    for index, row in enumerate(candles):
+        try:
+            if not isinstance(row, dict):
+                raise TypeError("Candle must be a dictionary")
+
+            ts = _as_datetime(row.get("timestamp", row.get("ts")))
+
+            values = {}
+            for field in ("open", "high", "low", "close", "volume"):
+                value = float(row[field])
+                if not math.isfinite(value):
+                    raise ValueError(f"{field} is not finite")
+                if field == "volume":
+                    if value < 0:
+                        raise ValueError("Negative futures volume")
+                elif value <= 0:
+                    raise ValueError(f"{field} must be positive")
+                values[field] = value
+
+            if values["high"] < max(values["open"], values["low"], values["close"]):
+                raise ValueError("Invalid candle high")
+
+            if values["low"] > min(values["open"], values["high"], values["close"]):
+                raise ValueError("Invalid candle low")
+
+            tick_count = int(row.get("tick_count", 0))
+            if tick_count < 0:
+                raise ValueError("Invalid tick count")
+
+            is_complete = row.get("is_complete")
+            if is_complete is not True:
+                raise ValueError("Cannot publish an incomplete candle")
+
+            quality = str(row.get("quality_status", "")).upper()
+            expected = "VALID" if tick_count >= 3 else "INVALID_LOW_TICK_COUNT"
+
+            if quality != expected:
+                raise ValueError(
+                    f"Expected {expected}, received {quality}"
+                )
+
+            source = str(row.get("source") or "angelone_websocket_futures_snap_quote")
+
+            prepared.append((
+                key,
+                token,
+                expiry_date,
+                ts,
+                ts.astimezone(IST).date(),
+                values["open"],
+                values["high"],
+                values["low"],
+                values["close"],
+                values["volume"],
+                source[:100],
+                tick_count,
+                True,
+                quality,
+            ))
+
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            if strict:
+                raise ValueError(
+                    f"Invalid futures candle at index {index}: {exc}"
+                ) from exc
+            logger.warning(
+                "Skipping invalid %s futures candle %s: %s",
+                key, index, exc
+            )
+
+    if not prepared:
+        return 0
+
+    init_futures_candle_table()
+
+    inserted = 0
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.executemany("""
+                INSERT INTO market_futures_ohlcv_candles (
+                    symbol, token, expiry, ts, trade_date,
+                    open, high, low, close, volume, source,
+                    tick_count, is_complete, quality_status
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s
+                )
+                ON CONFLICT (symbol, token, ts) DO NOTHING
+            """, prepared)
+
+            inserted = max(cur.rowcount, 0)
+
+    return inserted
+
+
+def get_recent_futures_candles(
+    symbol: str,
+    limit: int = 240,
+    max_age_seconds: float | None = None,
+    trade_date: date | str | None = None,
+) -> list[dict]:
+    """Return genuine, completed futures OHLCV candles for today's active contract.
+
+    The active contract is selected from the most recently observed valid row
+    for the symbol and IST trade date. This prevents stale prior-expiry futures
+    volume from being joined to current spot candles after a contract rollover.
+    Results are returned oldest-first. When max_age_seconds is set, the latest
+    bar must be fresh, but older bars from the same session remain available
+    for rolling-volume calculations.
+    """
+    key = _normalise_symbol(symbol)
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit must be an integer") from exc
+    if limit < 1 or limit > 10000:
+        raise ValueError("limit must be between 1 and 10000")
+
+    init_futures_candle_table()
+    if trade_date is None:
+        trade_date = datetime.now(IST).date()
+    elif not isinstance(trade_date, date):
+        trade_date = date.fromisoformat(str(trade_date)[:10])
+
+    with _connect() as conn:
+        contract = conn.execute(
+            """
+            SELECT token, expiry
+            FROM market_futures_ohlcv_candles
+            WHERE symbol = %s
+              AND trade_date = %s
+              AND is_complete IS TRUE
+              AND UPPER(quality_status) = 'VALID'
+              AND tick_count >= 3
+            ORDER BY ts DESC
+            LIMIT 1
+            """,
+            (key, trade_date),
+        ).fetchone()
+
+        if not contract:
+            return []
+
+        token, expiry = contract
+        rows = conn.execute(
+            """
+            SELECT ts, volume, source, tick_count, is_complete, quality_status
+            FROM market_futures_ohlcv_candles
+            WHERE symbol = %s
+              AND token = %s
+              AND expiry = %s
+              AND trade_date = %s
+              AND is_complete IS TRUE
+              AND UPPER(quality_status) = 'VALID'
+              AND tick_count >= 3
+            ORDER BY ts DESC
+            LIMIT %s
+            """,
+            (key, str(token), expiry, trade_date, limit),
+        ).fetchall()
+
+    if not rows:
+        return []
+
+    latest_ts = rows[0][0]
+    if latest_ts.tzinfo is None:
+        latest_ts = latest_ts.replace(tzinfo=timezone.utc)
+    latest_age = max(
+        0.0,
+        (datetime.now(timezone.utc) - latest_ts.astimezone(timezone.utc)).total_seconds(),
+    )
+    if max_age_seconds is not None and latest_age > max(0.0, float(max_age_seconds)):
+        logger.warning(
+            "%s active futures candles are stale: age=%.1fs limit=%.1fs",
+            key, latest_age, float(max_age_seconds),
+        )
+        return []
+
+    now_utc = datetime.now(timezone.utc)
+    result = []
+    for ts, volume, source, tick_count, is_complete, quality_status in reversed(rows):
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        volume = float(volume)
+        if not math.isfinite(volume) or volume < 0:
+            continue
+        ts_utc = ts.astimezone(timezone.utc)
+        result.append({
+            "timestamp": ts_utc.astimezone(IST).isoformat(),
+            "volume": volume,
+            "source": str(source or ""),
+            "tick_count": int(tick_count or 0),
+            "is_complete": bool(is_complete),
+            "quality_status": str(quality_status or "").upper(),
+            "token": str(token),
+            "expiry": expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry),
+            "age_seconds": max(0.0, (now_utc - ts_utc).total_seconds()),
+        })
+    return result
 
 
 def get_recent_candles(

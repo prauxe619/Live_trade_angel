@@ -1156,12 +1156,13 @@ class SensexCollector:
 
         # ── Sensex Futures (BFO Segment) ───────────────────────────────
         fut_rows = master.query("name=='SENSEX' and exch_seg=='BFO' and instrumenttype=='FUTIDX'").copy()
+        sx_fut_expiry = None
         if fut_rows.empty:
             logger.warning("SENSEX Futures not found in BFO segment! Futures basis will be 0.")
             sx_fut_token = None
         else:
             fut_rows["parsed_exp"] = pd.to_datetime(
-                fut_rows["expiry"], errors="coerce"
+                fut_rows["expiry"], errors="coerce", dayfirst=True, format="mixed"
             ).dt.date
             # --- FIX: Trust Angel One's reality, ignore the system clock ---
             today_ist = datetime.now(CONFIG["TZ"]).date()
@@ -1172,6 +1173,14 @@ class SensexCollector:
                 sx_fut_token = None
             else:
                 sx_fut_token = str(valid_futs.iloc[0]['token'])
+                sx_fut_expiry = valid_futs.iloc[0]["parsed_exp"].isoformat()
+
+        if self.ohlcv_stream is not None and sx_fut_token and sx_fut_expiry:
+            self.ohlcv_stream.set_futures_contract(
+                sx_fut_token, exchange_type=4, expiry=sx_fut_expiry
+            )
+        else:
+            logger.warning("[SENSEX] Futures WebSocket volume stream unavailable; breakout volume confirmation will fail closed.")
 
         # ── Sensex option chain from BFO ───────────────────────────────
         bfo = master.query(
@@ -1236,7 +1245,11 @@ class SensexCollector:
                         and self._reconnected_today != self.today):
                     logger.info("[SENSEX] Pre-market session reconnect.")
                     if self.connect():
+                        if self.ohlcv_stream is not None:
+                            self.ohlcv_stream.update_credentials(self.jwt_token, self.feed_token)
                         self._reconnected_today = self.today
+                    else:
+                        logger.error("[SENSEX] Pre-market reconnect failed; retaining current WebSocket credentials.")
 
                 if now_str < CONFIG["MARKET_OPEN"]:
                     logger.info(f"[SENSEX] Waiting for market open ({CONFIG['MARKET_OPEN']})...")

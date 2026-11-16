@@ -471,6 +471,9 @@ def _generate_ai_hook(index: str, direction: str, vix: float, alert_type: str = 
         "insight": "Patience is a position. The algo is waiting for high conviction. Don't force the trade. 🧘‍♂️"
     }
 
+    if os.getenv("OLLAMA_ENABLED", "false").strip().lower() not in {"1", "true", "yes", "on"}:
+        return fallbacks.get(alert_type, fallbacks["target"])
+
     base_rule = (
         "Write in pure English. Tone: professional trader, confident, sharp. "
         "NO hashtags. NO cringe. Max 20 words total."
@@ -488,7 +491,8 @@ def _generate_ai_hook(index: str, direction: str, vix: float, alert_type: str = 
         try:
             payload = {"model": "dolphin3:latest", "prompt": prompts.get(alert_type, prompts["target"]), "stream": False}
             async with aiohttp.ClientSession() as session:
-                async with session.post("http://localhost:11434/api/generate", json=payload, timeout=5) as r:
+                ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+            async with session.post(f"{ollama_url}/api/generate", json=payload, timeout=5) as r:
                     if r.status == 200:
                         result = await r.json()
                         text = result.get("response", "").strip().replace('"', "")
@@ -1173,10 +1177,14 @@ class SignalDataFetcher:
             snap["timestamp"] = item.get("timestamp", "")
             
             snap["candles"] = self._candles_from_snapshot(raw)
-            
-            # Read canonical OHLC history when snapshot candles are missing.
-            if snap["candles"].empty and source == "postgres":
-                snap["candles"] = self._candles_from_postgres(index_key)
+
+            # PostgreSQL is canonical in EC2 mode: it contains completed spot
+            # OHLC plus the separately persisted futures-volume stream. Prefer
+            # it even when the snapshot embeds older spot-only candle samples.
+            if source == "postgres":
+                db_candles = self._candles_from_postgres(index_key)
+                if not db_candles.empty:
+                    snap["candles"] = db_candles
             
             snap["_age_s"] = age_s
 
@@ -1345,12 +1353,75 @@ class SignalDataFetcher:
                 )
                 return pd.DataFrame()
 
+            # Spot index OHLC has no traded volume. Keep its volume field
+            # untouched and attach genuine futures volume in a separate column.
+            candles["timestamp"] = pd.to_datetime(
+                candles["timestamp"], errors="coerce", utc=True
+            )
+            candles["futures_volume"] = np.nan
+            try:
+                from collectors.scripts.shared_snapshots import get_recent_futures_candles
+
+                futures_rows = get_recent_futures_candles(
+                    index_key,
+                    limit=240,
+                    max_age_seconds=max(
+                        30.0, float(os.getenv("CANDLE_MAX_AGE_SECONDS", "180"))
+                    ),
+                )
+                if futures_rows:
+                    futures = pd.DataFrame(futures_rows)
+                    futures["timestamp"] = pd.to_datetime(
+                        futures["timestamp"], errors="coerce", utc=True
+                    )
+                    futures["volume"] = pd.to_numeric(
+                        futures["volume"], errors="coerce"
+                    )
+                    futures["tick_count"] = pd.to_numeric(
+                        futures["tick_count"], errors="coerce"
+                    )
+                    futures = futures.dropna(
+                        subset=["timestamp", "volume", "tick_count"]
+                    )
+                    futures = futures[
+                        (futures["volume"] >= 0)
+                        & (futures["tick_count"] >= 3)
+                        & futures["is_complete"].eq(True)
+                        & futures["quality_status"].astype(str).str.upper().eq("VALID")
+                    ]
+                    futures = futures[["timestamp", "volume"]].rename(
+                        columns={"volume": "futures_volume"}
+                    )
+                    candles = candles.drop(
+                        columns=["futures_volume"], errors="ignore"
+                    ).merge(
+                        futures,
+                        on="timestamp",
+                        how="left",
+                        validate="one_to_one",
+                    )
+                    matched = int(candles["futures_volume"].notna().sum())
+                    _log.info(
+                        "%s: matched %d/%d spot candles with genuine active-futures volume",
+                        index_key, matched, len(candles)
+                    )
+                else:
+                    _log.warning(
+                        "%s: no fresh valid active-futures volume candles; "
+                        "strong-breakout volume confirmation will fail closed",
+                        index_key,
+                    )
+            except Exception as futures_exc:
+                _log.warning(
+                    "%s: futures-volume read/join failed; breakout volume unavailable: %s",
+                    index_key, futures_exc,
+                )
+
             _log.info(
-                "%s: Loaded %d validated candles from PostgreSQL",
+                "%s: Loaded %d validated PostgreSQL spot candles",
                 index_key,
                 len(candles)
             )
-
             return candles
 
         except Exception as exc:
@@ -1443,10 +1514,14 @@ class SignalDataFetcher:
                         return v
                 except Exception as exc:
                     _log.debug("Local VIX snapshot read failed (%s): %s", snap_path, exc)
-        df = self.fetch_candles_api(VIX_TOKEN, bars=5)
-        if not df.empty:
-            value = float(df["close"].iloc[-1])
-            return value if math.isfinite(value) and value > 0 else 0.0
+        allow_api_fallback = os.getenv(
+            "ALLOW_ANGEL_VIX_API_FALLBACK", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if allow_api_fallback:
+            df = self.fetch_candles_api(VIX_TOKEN, bars=5)
+            if not df.empty:
+                value = float(df["close"].iloc[-1])
+                return value if math.isfinite(value) and value > 0 else 0.0
         return 0.0
 
     
@@ -1465,18 +1540,22 @@ class SignalDataFetcher:
 
         if snap and snap.get("spot", 0) > 0:
             if snap["candles"].empty:
-                if in_session:
-                    _log.info(
-                        f"{index_key}: snapshot has no valid OHLC candles; "
-                        "requesting Angel One historical candles"
+                allow_api_fallback = os.getenv(
+                    "ALLOW_ANGEL_CANDLE_API_FALLBACK", "false"
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                if in_session and allow_api_fallback:
+                    _log.warning(
+                        "%s: PostgreSQL/snapshot OHLC unavailable; explicit Angel API fallback enabled",
+                        index_key,
                     )
                     snap["candles"] = self.fetch_candles_api(
                         cfg["token"], cfg["exchange"]
                     )
                 else:
                     _log.warning(
-                        f"{index_key}: valid OHLC candles missing outside market hours; "
-                        "skipping API fallback"
+                        "%s: valid PostgreSQL/snapshot OHLC missing; "
+                        "Angel API fallback disabled or outside session; skipping",
+                        index_key,
                     )
             if snap["candles"].empty:
                 _log.warning(
@@ -1502,26 +1581,21 @@ class SignalDataFetcher:
                 "_age_s": None,
             }
 
-        _log.info(f"No usable snapshot for {index_key} — fetching historical candles from Angel One")
-        candles = self.fetch_candles_api(cfg["token"], cfg["exchange"])
-        spot = float(candles["close"].iloc[-1]) if not candles.empty else 0.0
-        vix = self.fetch_vix()
-        if candles.empty:
-            _log.warning(
-                f"{index_key}: Angel One returned no valid historical candles; "
-                "no signal should be generated for this index"
-            )
-
+        _log.warning(
+            "%s: no fresh PostgreSQL market snapshot; refusing API-only signal "
+            "generation with default PCR/GEX values",
+            index_key,
+        )
         return {
-            "spot": spot,
-            "vix": vix,
+            "spot": 0.0,
+            "vix": 0.0,
             "put_oi": 0,
             "call_oi": 0,
-            "pcr": 1.0,
+            "pcr": 0.0,
             "net_gex": 0,
-            "max_pain": spot,
-            "candles": candles,
-            "_age_s": 0,
+            "max_pain": 0.0,
+            "candles": pd.DataFrame(),
+            "_age_s": None,
         }
 
     def get_option_quote(self, index_key: str, strike: int, direction: str,
@@ -1856,36 +1930,35 @@ class SignalDataFetcher:
             
 
     
-def get_option_premium(self, index_key: str, strike: int, direction: str, target_expiry: str = "", *, side: str = "ask") -> float:
-    """Return the requested fresh option price: ask for entry, bid for exit, LTP for marking."""
-    side = str(side).strip().lower()
-    if side not in {"ask", "bid", "ltp"}:
-        raise ValueError("side must be 'ask', 'bid', or 'ltp'")
+    def get_option_premium(self, index_key: str, strike: int, direction: str, target_expiry: str = "", *, side: str = "ask") -> float:
+        """Return the requested fresh option price: ask for entry, bid for exit, LTP for marking."""
+        side = str(side).strip().lower()
+        if side not in {"ask", "bid", "ltp"}:
+            raise ValueError("side must be 'ask', 'bid', or 'ltp'")
 
-    quote = self.get_option_quote(index_key, strike, direction, target_expiry)
-    if not quote.get("entry_eligible"):
-        _log.warning("Option price blocked for %s %s %s %s side=%s: %s", index_key, strike, direction, target_expiry, side, quote.get("reason"))
-        return 0.0
-
-    if side in {"bid", "ask"}:
-        if not quote.get("quote_valid"):
-            _log.warning("Option %s blocked: invalid bid/ask quote for %s %s %s", side, index_key, strike, direction)
+        quote = self.get_option_quote(index_key, strike, direction, target_expiry)
+        if not quote.get("entry_eligible"):
+            _log.warning("Option price blocked for %s %s %s %s side=%s: %s", index_key, strike, direction, target_expiry, side, quote.get("reason"))
             return 0.0
-        value = quote.get(side, 0.0)
-    else:
-        value = quote.get("ltp", 0.0)
 
-    try:
-        value = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return 0.0
+        if side in {"bid", "ask"}:
+            if not quote.get("quote_valid"):
+                _log.warning("Option %s blocked: invalid bid/ask quote for %s %s %s", side, index_key, strike, direction)
+                return 0.0
+            value = quote.get(side, 0.0)
+        else:
+            value = quote.get("ltp", 0.0)
 
-    if not math.isfinite(value) or value <= 0:
-        _log.warning("Invalid option %s price for %s %s %s: %s", side, index_key, strike, direction, value)
-        return 0.0
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
 
-    return value
+        if not math.isfinite(value) or value <= 0:
+            _log.warning("Invalid option %s price for %s %s %s: %s", side, index_key, strike, direction, value)
+            return 0.0
 
+        return value
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2607,7 +2680,10 @@ class StrategyEngine:
             result["reason"] = "missing_ohlcv_columns"
             return result
 
-        if len(candles) < STRONG_BK_MIN_BARS + 2:
+        minimum_rows = STRONG_BK_MIN_BARS + (
+            1 if "is_complete" in candles.columns else 2
+        )
+        if len(candles) < minimum_rows:
             result["reason"] = "insufficient_history"
             return result
 
@@ -2620,13 +2696,22 @@ class StrategyEngine:
             data = data.replace([np.inf, -np.inf], np.nan)
             data = data.dropna(subset=list(required))
 
-            if len(data) < STRONG_BK_MIN_BARS + 2:
+            if len(data) < minimum_rows:
                 result["reason"] = "insufficient_valid_bars"
                 return result
 
-            # Use the most recent completed candle.
-            # The final row is excluded to avoid acting on a forming candle.
-            closed = data.iloc[:-1].copy()
+            # PostgreSQL candle readers return completed bars only. When
+            # completion metadata exists, use all explicitly completed rows;
+            # otherwise retain the legacy safety rule and exclude the final
+            # potentially-forming row.
+            if "is_complete" in data.columns:
+                complete_mask = data["is_complete"].map(
+                    lambda value: value is True
+                    or str(value).strip().lower() in {"true", "1", "yes"}
+                )
+                closed = data.loc[complete_mask].copy()
+            else:
+                closed = data.iloc[:-1].copy()
 
             if len(closed) < STRONG_BK_MIN_BARS + 1:
                 result["reason"] = "insufficient_closed_bars"
@@ -2647,7 +2732,10 @@ class StrategyEngine:
                 result["reason"] = "invalid_atr"
                 return result
 
-            if atr / float(spot) < STRONG_BK_MIN_ATR_PCT:
+            atr_pct = float(atr) / float(spot)
+            result["atr"] = round(float(atr), 2)
+            result["atr_pct"] = round(atr_pct, 6)
+            if atr_pct < STRONG_BK_MIN_ATR_PCT:
                 result["reason"] = "volatility_too_low"
                 return result
 
@@ -3944,6 +4032,7 @@ class DailySignalEngine:
         self._day_signal_count  = 0
         self._free_sent_today   = False
         self._swing_fired_today = set()
+        self._ic_fired_today = set()
         self._best_signal: Optional[dict] = None
         self._last_results: list = []
 
@@ -3981,6 +4070,7 @@ class DailySignalEngine:
                 self._day_signal_count = st.get("day_signal_count", 0)
                 self._free_sent_today = st.get("free_sent_today", False)
                 self._swing_fired_today = set(st.get("swing_fired_today", []))
+                self._ic_fired_today = set(st.get("ic_fired_today", []))
                 self._best_signal = st.get("best_signal")
                 self._last_sniper = st.get("last_sniper", {})
                 self._last_strong_breakout = {}
@@ -3997,6 +4087,7 @@ class DailySignalEngine:
                         self._day_signal_count  = st.get("day_signal_count", 0)
                         self._free_sent_today   = st.get("free_sent_today", False)
                         self._swing_fired_today = set(st.get("swing_fired_today", []))
+                        self._ic_fired_today    = set(st.get("ic_fired_today", []))
                         self._best_signal       = st.get("best_signal", None)
                         self._last_sniper       = st.get("last_sniper", {})
                         self._week_signal_count = st.get("week_signal_count", 0)
@@ -4014,6 +4105,7 @@ class DailySignalEngine:
                 "day_signal_count": self._day_signal_count,
                 "free_sent_today": self._free_sent_today,
                 "swing_fired_today": list(self._swing_fired_today),
+                "ic_fired_today": list(self._ic_fired_today),
                 "best_signal": self._best_signal,
                 "last_sniper": self._last_sniper,
                 "week_signal_count": self._week_signal_count,
@@ -4025,6 +4117,7 @@ class DailySignalEngine:
                 "day_signal_count": self._day_signal_count,
                 "free_sent_today": self._free_sent_today,
                 "swing_fired_today": list(self._swing_fired_today),
+                "ic_fired_today": list(self._ic_fired_today),
                 "best_signal": self._best_signal,
                 "last_sniper": self._last_sniper,
                 "week_signal_count": self._week_signal_count,
@@ -5434,19 +5527,46 @@ class DailySignalEngine:
                 snap = self.fetcher.get_index_data(idx_key)
                 spot = float(snap.get("spot", 0) or 0)
                 candles = snap.get("candles", pd.DataFrame())
-                _log.info("[STRONG BK DATA] %s | spot=%.2f | candles=%d | pending=%s", idx_key, spot, 0 if candles is None 
-                else len(candles), bool(self._strong_breakout_pending.get(idx_key)))
+                futures_volume_bars = (
+                    int(candles["futures_volume"].notna().sum())
+                    if isinstance(candles, pd.DataFrame)
+                    and "futures_volume" in candles.columns
+                    else 0
+                )
+                _log.info(
+                    "[STRONG BK DATA] %s | spot=%.2f | spot_candles=%d | "
+                    "futures_volume_bars=%d | pending=%s",
+                    idx_key, spot, 0 if candles is None else len(candles),
+                    futures_volume_bars,
+                    bool(self._strong_breakout_pending.get(idx_key)),
+                )
 
                 if spot <= 0 or candles is None or candles.empty:
-                    _log.warning("[STRONG BK DATA] %s | SKIPPED | spot=%.2f | candles=%d", idx_key, spot, 0 if candles is None else len(candles))
+                    _log.warning(
+                        "[STRONG BK DATA] %s | SKIPPED | spot=%.2f | candles=%d",
+                        idx_key, spot, 0 if candles is None else len(candles),
+                    )
                     continue
+
+                if "futures_volume" not in candles.columns or futures_volume_bars < STRONG_BK_MIN_BARS + 1:
+                    _log.info(
+                        "[STRONG BK STATE] %s | NOT READY | "
+                        "reason=insufficient_genuine_futures_volume | bars=%d required=%d",
+                        idx_key, futures_volume_bars, STRONG_BK_MIN_BARS + 1,
+                    )
+                    continue
+
+                breakout_candles = candles.copy()
+                breakout_candles["volume"] = pd.to_numeric(
+                    breakout_candles["futures_volume"], errors="coerce"
+                )
 
                 pending = self._strong_breakout_pending.setdefault(
                     idx_key, {}
                 )
 
                 bk = self.strategy.strong_breakout_retest(
-                    candles=candles,
+                    candles=breakout_candles,
                     spot=spot,
                     index_key=idx_key,
                     pending=pending,
