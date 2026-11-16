@@ -128,21 +128,17 @@ def _first_valid_env(*names):
             return value
     return ""
 
-SIGNAL_BOT_TOKEN = _first_valid_env(
-    "SIGNAL_BOT_TOKEN",
-    "LIVE_BOT_TOKEN",
-    "VIP_BOT_TOKEN",
-    "BOT_TOKEN",
-)
+# Use the existing signal-engine bot and exactly the two configured destinations.
+SIGNAL_BOT_TOKEN = os.getenv("SIGNAL_BOT_TOKEN", "").strip()
+_CHAT_ID = os.getenv("CHAT_ID", "").strip()
+_LIVE_BOT_CHANNEL_ID = os.getenv("LIVE_BOT_CHANNEL_ID", "").strip()
+TELEGRAM_CHAT_IDS = tuple(dict.fromkeys(
+    chat_id for chat_id in (_CHAT_ID, _LIVE_BOT_CHANNEL_ID) if chat_id
+))
 
-TRADING_TELEGRAM_CHAT_ID = (
-    os.getenv("TRADING_TELEGRAM_CHAT_ID", "").strip()
-    or os.getenv("LIVE_BOT_CHANNEL_ID", "").strip()
-    or os.getenv("VIP_CHANNEL_ID", "").strip()
-    or os.getenv("CHAT_ID", "").strip()
-)
-
-VIP_CHANNEL_ID = TRADING_TELEGRAM_CHAT_ID
+# Compatibility aliases: the legacy single-chat name now means the channel only.
+TRADING_TELEGRAM_CHAT_ID = _LIVE_BOT_CHANNEL_ID
+VIP_CHANNEL_ID = _LIVE_BOT_CHANNEL_ID
 
 PAYMENT_LINKS = {
     "trial"  : os.getenv("PAYMENT_LINK_TRIAL",   "https://cosmofeed.com/vig/69e4b42c9e4e440013c2b4dd"),
@@ -385,17 +381,32 @@ def _is_personal_trade_update(text: str) -> bool:
         for group in allowed_headers
     )
 def _to_vip(text: str):
-    """Queue only allowlisted entries and final exits to the configured chat."""
-    if not _is_personal_trade_update(text):
+    """Queue every engine trade/decision notification to both configured chats."""
+    if not isinstance(text, str) or not text.strip():
         return
-    if not SIGNAL_BOT_TOKEN or not TRADING_TELEGRAM_CHAT_ID:
-        _log.error("Trade alert blocked: Telegram token or destination is missing.")
+    if not SIGNAL_BOT_TOKEN or len(TELEGRAM_CHAT_IDS) != 2:
+        _log.error(
+            "Trade alert blocked: SIGNAL_BOT_TOKEN and exactly two distinct "
+            "Telegram destinations are required (found %d).",
+            len(TELEGRAM_CHAT_IDS),
+        )
         return
-    try:
-        _tq.put_nowait((SIGNAL_BOT_TOKEN, TRADING_TELEGRAM_CHAT_ID, text))
+
+    queued = 0
+    for chat_id in TELEGRAM_CHAT_IDS:
+        try:
+            _tq.put_nowait((SIGNAL_BOT_TOKEN, chat_id, text))
+            queued += 1
+        except queue.Full:
+            _log.error("Telegram queue full; destination %s was not queued.", chat_id)
+
+    if queued:
         _ensure_tq_worker()
-    except queue.Full:
-        _log.error("Telegram queue full; trade notification was not queued")
+    if queued != len(TELEGRAM_CHAT_IDS):
+        _log.error(
+            "Telegram fan-out incomplete: queued=%d destinations=%d",
+            queued, len(TELEGRAM_CHAT_IDS),
+        )
 
 
 def _to_free(text: str):
@@ -5746,8 +5757,8 @@ def main():
     print(f"  ✅ Lot size advisory (VIX-based)")
     print("═" * 64)
     print(f"  SIGNAL_BOT_TOKEN : {'✅ SET' if SIGNAL_BOT_TOKEN else '❌ MISSING'}")
-    print(f"  TRADING_TELEGRAM_CHAT_ID : {'✅ SET' if TRADING_TELEGRAM_CHAT_ID else '❌ MISSING'}")
-    print("  Telegram mode            : personal trade updates only")
+    print(f"  Telegram destinations    : {len(TELEGRAM_CHAT_IDS)}/2 configured")
+    print("  Telegram mode            : all engine trade/decision alerts to both destinations")
     print(f"  Signal Angel API : {'✅ SET' if SIGNAL_API_KEY   else '⚠️  using ANGEL_API_KEY fallback'}")
     print()
     print(f"  Snapshots:")

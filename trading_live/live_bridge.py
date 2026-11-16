@@ -102,15 +102,25 @@ class LiveBridge:
         return AngelOneBroker.find_contract(path, index, expiry, strike, direction)
 
     def _telegram(self, text: str):
-        tok = os.getenv("SIGNAL_BOT_TOKEN", "")
-        chat = os.getenv("TRADING_TELEGRAM_CHAT_ID", os.getenv("VIP_CHANNEL_ID", ""))
-        if not tok or not chat:
+        """Send every live-bridge alert to the two canonical Telegram destinations."""
+        token = os.getenv("SIGNAL_BOT_TOKEN", "").strip()
+        raw_destinations = (os.getenv("CHAT_ID", "").strip(),
+                            os.getenv("LIVE_BOT_CHANNEL_ID", "").strip())
+        destinations = tuple(dict.fromkeys(chat for chat in raw_destinations if chat))
+        if not token or len(destinations) != 2:
+            log.error("Telegram routing disabled: SIGNAL_BOT_TOKEN and two distinct destinations are required")
             return
-        try:
-            data = urllib.parse.urlencode({"chat_id": chat, "text": text[:3900]}).encode()
-            urllib.request.urlopen(f"https://api.telegram.org/bot{tok}/sendMessage", data=data, timeout=6)
-        except Exception as e:
-            log.warning("Telegram notify failed: %s", e)
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        for chat_id in destinations:
+            try:
+                data = urllib.parse.urlencode({"chat_id": chat_id, "text": str(text)[:3900]}).encode()
+                with urllib.request.urlopen(url, data=data, timeout=6) as response:
+                    if getattr(response, "status", 200) != 200:
+                        log.warning("Telegram notify returned HTTP %s for one destination",
+                                    getattr(response, "status", "unknown"))
+            except Exception as exc:
+                # Continue to the second destination even if the first delivery fails.
+                log.warning("Telegram notify failed for one destination: %s", exc)
 
     def _alert(self, text, key=None, every_s=0):
         log.error("LIVE ALERT: %s", text)

@@ -3,10 +3,10 @@
 ║        Black_Blood  —  telegram_vip_alert.py  v3  (Engagement Edition)     ║
 ║                                                                              ║
 ║  WHAT THIS FILE DOES:                                                        ║
-║   1. Sends live CE/PE alerts to VIP channel (paid subscribers only)         ║
-║   2. Sends daily EOD teaser to FREE channel (FOMO funnel)                   ║
-║   3. Posts payment links with ALL plan options to free channel               ║
-║   4. Runs a background scheduler — automatic posts at set times             ║
+║   1. Sends trading/collector notifications to the two signal-engine chats    ║
+║   2. Uses SIGNAL_BOT_TOKEN for both destinations                             ║
+║   3. Keeps promotional/free-channel posts disabled in personal mode         ║
+║   4. Provides a queued sender so notifications do not block collectors      ║
 ║      → 9:10 AM  Morning hype post + payment link (Mon-Fri)                  ║
 ║      → 10:30 AM Mid-morning FOMO hook (Mon-Fri)                             ║
 ║      → 12:00 PM Lunch break update (Mon-Fri)                                ║
@@ -22,10 +22,10 @@
 ║   • Monthly   : ₹3,999 / 30 days  ← push this                              ║
 ║   • Yearly    : ₹29,999 / 365 days                                          ║
 ║                                                                              ║
-║  ENV VARS (add to .env):                                                    ║
-║   VIP_BOT_TOKEN   = bot token from @BotFather                               ║
-║   VIP_CHANNEL_ID  = -100xxxxxxxxxx  (VIP private channel)                  ║
-║   FREE_CHANNEL_ID = -100xxxxxxxxxx  (Free public channel)                  ║
+║  ENV VARS (from /etc/live-trade-angel.env):                                 ║
+║   SIGNAL_BOT_TOKEN      = existing signal-engine bot token                  ║
+║   CHAT_ID               = personal Telegram destination                     ║
+║   LIVE_BOT_CHANNEL_ID   = existing Telegram channel destination             ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -53,9 +53,21 @@ load_dotenv()
 #  CONFIGURATION  — UPDATE THESE BEFORE RUNNING
 # ══════════════════════════════════════════════════════════════════════════════
 
-_VIP_BOT_TOKEN  : str = os.getenv("VIP_BOT_TOKEN", "")
-_VIP_CHANNEL_ID : str = os.getenv("VIP_CHANNEL_ID", "")
-_FREE_CHANNEL_ID: str = os.getenv("FREE_CHANNEL_ID", "")
+# One bot and exactly two destinations, shared with daily_signal_engine_v11.py.
+_SIGNAL_BOT_TOKEN: str = os.getenv("SIGNAL_BOT_TOKEN", "").strip()
+_CHAT_ID: str = os.getenv("CHAT_ID", "").strip()
+_LIVE_BOT_CHANNEL_ID: str = os.getenv("LIVE_BOT_CHANNEL_ID", "").strip()
+
+def _telegram_destinations() -> tuple[str, ...]:
+    """Return the two configured destinations once each; never route elsewhere."""
+    return tuple(dict.fromkeys(
+        chat_id for chat_id in (_CHAT_ID, _LIVE_BOT_CHANNEL_ID) if chat_id
+    ))
+
+# Compatibility aliases for older imports; routing always uses _telegram_destinations().
+_VIP_BOT_TOKEN = _SIGNAL_BOT_TOKEN
+_VIP_CHANNEL_ID = _LIVE_BOT_CHANNEL_ID
+_FREE_CHANNEL_ID = ""
 
 # ── PASTE YOUR COSMOFEED LINKS HERE ──────────────────────────────────────────
 PAYMENT_LINKS = {
@@ -130,15 +142,36 @@ def escape_markdown(text: str) -> str:
     return text
 
 def send_telegram_message(message: str, *args, **kwargs) -> bool:
-    """Compatibility wrapper for collector Telegram notifications."""
-    token = _VIP_BOT_TOKEN
-    chat_id = _VIP_CHANNEL_ID
+    """Queue a notification for both configured signal-engine destinations.
 
-    if args:
-        chat_id = str(args[0])
-    chat_id = str(kwargs.get("chat_id", chat_id) or "")
+    Legacy chat_id arguments are intentionally ignored so callers cannot route
+    messages to an extra VIP/free channel. Returns True when both destinations
+    were successfully queued.
+    """
+    del args, kwargs
+    if not _SIGNAL_BOT_TOKEN:
+        _logger.error("Telegram notification blocked: SIGNAL_BOT_TOKEN is missing.")
+        return False
 
-    return _telegram_post(token, chat_id, str(message))
+    destinations = _telegram_destinations()
+    if len(destinations) != 2:
+        _logger.error(
+            "Telegram notification blocked: expected exactly 2 destinations, found %d.",
+            len(destinations),
+        )
+        return False
+
+    queued = 0
+    for chat_id in destinations:
+        try:
+            _msg_queue.put_nowait((_SIGNAL_BOT_TOKEN, chat_id, str(message)))
+            queued += 1
+        except queue.Full:
+            _logger.error("Telegram queue full; destination %s was not queued.", chat_id)
+
+    if queued:
+        _ensure_telegram_worker()
+    return queued == len(destinations)
     
 def _telegram_post(bot_token: str, chat_id: str, text: str,
                    photo_path: str = None) -> bool:
@@ -213,12 +246,25 @@ def _worker():
             _logger.error(f"Worker error: {exc}")
 
 
-threading.Thread(target=_worker, daemon=True, name="vip-sender").start()
+_worker_lock = threading.Lock()
+_worker_started = False
+
+def _ensure_telegram_worker():
+    global _worker_started
+    if _worker_started:
+        return
+    with _worker_lock:
+        if not _worker_started:
+            threading.Thread(target=_worker, daemon=True, name="signal-telegram-sender").start()
+            _worker_started = True
+
+# Start eagerly for compatibility with existing collector imports.
+_ensure_telegram_worker()
 
 
 def _enqueue_vip(text: str):
-    """Disable generic VIP commentary and promotional messages."""
-    return
+    """Route trade entry/exit alerts through the shared two-destination sender."""
+    send_telegram_message(text)
 
 
 def _enqueue_free(text: str, photo_path: str = None):
@@ -1005,10 +1051,10 @@ if __name__ == "__main__":
     print(f"    15:30  EOD results")
     print("═" * 58)
 
-    if not _VIP_BOT_TOKEN or not _VIP_CHANNEL_ID:
-        _logger.error("CRITICAL: Bot credentials missing in .env")
+    if not _SIGNAL_BOT_TOKEN or len(_telegram_destinations()) != 2:
+        _logger.error("CRITICAL: SIGNAL_BOT_TOKEN and both Telegram destinations are required.")
     else:
-        _logger.info("System Ready. Waiting for signals from trading engine...")
+        _logger.info("System Ready. Shared two-destination Telegram sender is configured.")
 
     try:
         while True:

@@ -1,59 +1,57 @@
-import requests
-import os
+"""Canonical two-destination Telegram notifier for trading scripts.
+
+Only SIGNAL_BOT_TOKEN, CHAT_ID and LIVE_BOT_CHANNEL_ID are used.
+Legacy token/chat variables are deliberately ignored to prevent accidental
+routing through retired bots or additional channels.
+"""
 import logging
+import os
+
+import requests
 from dotenv import load_dotenv
 
-# Setup Logger
 logger = logging.getLogger("telegram")
-
 load_dotenv()
 
-# ---------------------------------------------
-# 🔑 ENVIRONMENT CONFIGURATION
-# Automatically checks your custom live variables first, 
-# with fallback support for standard names.
-# ---------------------------------------------
-BOT_TOKEN = os.getenv("LIVE_BOT_TOKEN", os.getenv("SIGNAL_BOT_TOKEN", os.getenv("BOT_TOKEN", "")))
-CHAT_ID = os.getenv("LIVE_BOT_CHANNEL_ID", os.getenv("TRADING_TELEGRAM_CHAT_ID", os.getenv("CHAT_ID", "")))
-# ---------------------------------------------
+BOT_TOKEN = os.getenv("SIGNAL_BOT_TOKEN", "").strip()
+TELEGRAM_DESTINATIONS = tuple(dict.fromkeys(
+    chat for chat in (
+        os.getenv("CHAT_ID", "").strip(),
+        os.getenv("LIVE_BOT_CHANNEL_ID", "").strip(),
+    ) if chat
+))
+# Compatibility name for older imports; delivery still fans out to both IDs.
+CHAT_ID = TELEGRAM_DESTINATIONS[0] if TELEGRAM_DESTINATIONS else ""
+
 
 def send_telegram(message: str):
-    """
-    Sends a message to the configured Telegram chat.
-    This is the standard function name used by Autopilot.
-    """
-    if not BOT_TOKEN or not CHAT_ID:
-        logger.warning(" Telegram keys missing (BOT_TOKEN or CHAT_ID). Skipping alert.")
-        return
+    """Send the same alert to both canonical destinations; fail closed on bad config."""
+    if not BOT_TOKEN or len(TELEGRAM_DESTINATIONS) != 2:
+        logger.error("Telegram routing disabled: SIGNAL_BOT_TOKEN and two distinct destinations are required")
+        return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"  # Supports bold/italic
-    }
-    
-    try:
-        response = requests.post(url, json=payload, timeout=5)
-        if response.status_code == 200:
-            # Uncomment if you want logs for every message
-            # logger.info(" Telegram Alert Sent!")
-            pass
-        else:
-            logger.error(f" Failed to send Telegram: {response.text}")
-            print(f" Failed to send Telegram: {response.text}")
-    except Exception as e:
-        logger.error(f" Connection Error: {e}")
-        print(f" Connection Error: {e}")
+    all_ok = True
+    for chat_id in TELEGRAM_DESTINATIONS:
+        payload = {"chat_id": chat_id, "text": str(message)[:3900], "parse_mode": "HTML"}
+        try:
+            response = requests.post(url, json=payload, timeout=6)
+            if response.status_code != 200:
+                all_ok = False
+                logger.error("Telegram delivery failed for one destination (HTTP %s): %s",
+                             response.status_code, response.text[:500])
+        except Exception:
+            all_ok = False
+            logger.exception("Telegram connection failed for one destination")
+    return all_ok
 
-# --- ALIASES (CRITICAL) ---
-# These ensure that if a script calls 'send_alert' or 'send_telegram_message', 
-# it gets routed to the main function above.
+
+# Backwards-compatible aliases used by existing callers.
 send_alert = send_telegram
 send_telegram_message = send_telegram
 
-# Test it immediately when running this file
+
 if __name__ == "__main__":
-    print(f"Bot Token: {'SET (Length: ' + str(len(BOT_TOKEN)) + ')' if BOT_TOKEN else 'MISSING'}")
-    print(f"Chat ID: {CHAT_ID if CHAT_ID else 'MISSING'}")
-    send_telegram("🚀 <b>Live Trader System Connected!</b>\nTesting unified channel connection...")
+    print(f"Bot token: {'SET' if BOT_TOKEN else 'MISSING'}")
+    print(f"Distinct Telegram destinations configured: {len(TELEGRAM_DESTINATIONS)} (expected 2)")
+    send_telegram("🚀 <b>Live Trader System Connected!</b>\\nTesting unified two-destination connection...")
