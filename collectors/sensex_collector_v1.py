@@ -31,6 +31,7 @@ import subprocess
 import requests
 import pytz
 import pyotp
+from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -54,6 +55,9 @@ from collectors.scripts.instrument_master_store import get_instrument_master
 # ══════════════════════════════════════════════════════════════════
 #  SYSTEM CONFIGURATION  — tune here, touch nothing else
 # ══════════════════════════════════════════════════════════════════
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
+
 def env(key, default=None):
     return os.getenv(key, default)
 
