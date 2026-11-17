@@ -9,7 +9,10 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, redirect, session, url_for
+from werkzeug.security import generate_password_hash, check_password_hash
+import secrets, hmac, re, urllib.parse, urllib.request, urllib.error
+from contextlib import contextmanager
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -20,6 +23,228 @@ from flask import Flask, jsonify, request
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "")
+if not app.secret_key:
+    # Persist a random key locally so sessions survive normal service restarts.
+    _secret_file = Path(os.environ.get("BLACK_AUTH_SECRET_FILE", str(Path(__file__).with_name(".black_session_secret"))))
+    try:
+        _secret_file.parent.mkdir(parents=True, exist_ok=True)
+        if _secret_file.exists():
+            app.secret_key = _secret_file.read_text().strip()
+        else:
+            _secret = secrets.token_urlsafe(48)
+            _secret_file.write_text(_secret)
+            try: _secret_file.chmod(0o600)
+            except OSError: pass
+            app.secret_key = _secret
+    except OSError:
+        raise RuntimeError("Set FLASK_SECRET_KEY: unable to create persistent session secret")
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "1").lower() not in {"0", "false", "no"},
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
+)
+AUTH_DB = Path(os.environ.get("BLACK_AUTH_DB", str(Path(__file__).resolve().parent / "black_auth.db")))
+
+
+@contextmanager
+def _auth_connect():
+    AUTH_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(AUTH_DB), timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _init_auth_db():
+    with _auth_connect() as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS auth_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE COLLATE NOCASE,
+            phone TEXT UNIQUE,
+            password_hash TEXT,
+            display_name TEXT NOT NULL DEFAULT 'BLACK Admin',
+            google_sub TEXT UNIQUE,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_auth_users_phone ON auth_users(phone)")
+        admin_email = os.environ.get("BLACK_ADMIN_EMAIL", "").strip().lower()
+        admin_password = os.environ.get("BLACK_ADMIN_PASSWORD", "")
+        admin_phone = re.sub(r"\D", "", os.environ.get("BLACK_ADMIN_PHONE", "")) or None
+        if admin_email and admin_password:
+            row = db.execute("SELECT id FROM auth_users WHERE email=?", (admin_email,)).fetchone()
+            if not row:
+                db.execute("INSERT INTO auth_users(email, phone, password_hash, display_name) VALUES(?,?,?,?)",
+                           (admin_email, admin_phone, generate_password_hash(admin_password), "BLACK Admin"))
+            elif admin_phone:
+                db.execute("UPDATE auth_users SET phone=COALESCE(phone, ?) WHERE email=?", (admin_phone, admin_email))
+
+
+_init_auth_db()
+
+
+def _current_user():
+    uid = session.get("user_id")
+    if not uid: return None
+    with _auth_connect() as db:
+        return db.execute("SELECT id,email,phone,display_name FROM auth_users WHERE id=? AND is_active=1", (uid,)).fetchone()
+
+
+def _login_user(user):
+    session.clear()
+    session.permanent = True
+    session["user_id"] = int(user["id"])
+    session["auth_at"] = int(time.time())
+
+
+def _json_error(message, status=400):
+    return jsonify({"ok": False, "error": message}), status
+
+
+LOGIN_HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BLACK | Secure Login</title><style>
+:root{color-scheme:dark;--bg:#070a13;--panel:#101728;--line:#26324c;--muted:#91a0bf;--blue:#4388ff;--white:#edf3ff}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(ellipse at 50% 0,#14264a 0,transparent 55%),var(--bg);font:14px Inter,system-ui;color:var(--white);padding:22px}.wrap{width:min(440px,100%)}.brand{text-align:center;margin-bottom:25px}.mark{font-size:34px;font-weight:900;letter-spacing:9px}.sub{color:var(--muted);font-size:11px;letter-spacing:3px;margin-top:7px}.card{background:linear-gradient(145deg,#121c30,#0c1220);border:1px solid var(--line);border-radius:18px;padding:28px;box-shadow:0 24px 80px #0009}.eyebrow{color:#72a6ff;font-size:10px;letter-spacing:2px;font-weight:800}.h{font-size:23px;font-weight:800;margin:9px 0 5px}.desc{color:var(--muted);font-size:12px;margin-bottom:22px}.tabs{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:18px}.tab{border:1px solid var(--line);background:#0b1220;color:#9eabc5;padding:11px;border-radius:9px;cursor:pointer}.tab.active{color:white;border-color:#4388ff;background:#14284a}.field{margin:13px 0}.field label{display:block;color:#aab7d0;font-size:11px;margin-bottom:7px}.field input{width:100%;background:#080f1d;border:1px solid #2b3854;border-radius:9px;padding:13px;color:white;outline:none}.field input:focus{border-color:#4388ff}.btn{width:100%;border:0;border-radius:9px;background:linear-gradient(90deg,#2563eb,#4388ff);color:white;padding:13px;font-weight:800;cursor:pointer;margin-top:8px}.google{background:#f4f6fb;color:#172033}.divider{display:flex;align-items:center;gap:12px;color:#66738e;font-size:10px;margin:18px 0}.divider:before,.divider:after{content:'';height:1px;background:#29344b;flex:1}.msg{min-height:18px;color:#ff9d9d;font-size:12px;margin-top:12px}.note{font-size:10px;color:#65738f;text-align:center;line-height:1.6;margin:17px 8px 0}.panel{display:none}.panel.active{display:block}.hidden{display:none!important}</style></head><body><main class="wrap"><div class="brand"><div class="mark">BLACK</div><div class="sub">TRADING INTELLIGENCE TERMINAL</div></div><section class="card"><div class="eyebrow">SECURE ACCESS</div><div class="h">Welcome back</div><div class="desc">Sign in to access your private trading dashboard.</div><div class="tabs"><button class="tab active" data-tab="password">Email & Password</button><button class="tab" data-tab="mobile">Mobile OTP</button></div><div id="password" class="panel active"><form id="passwordForm"><div class="field"><label>Email address</label><input name="email" type="email" autocomplete="username" required placeholder="you@example.com"></div><div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password" required placeholder="Your password"></div><button class="btn">Sign in securely</button></form></div><div id="mobile" class="panel"><div class="field"><label>Mobile number (with country code)</label><input id="phone" type="tel" autocomplete="tel" placeholder="919876543210" maxlength="15"></div><button class="btn" id="sendOtp">Send OTP</button><div id="otpArea" class="hidden"><div class="field"><label>6-digit verification code</label><input id="otp" inputmode="numeric" maxlength="6" placeholder="Enter OTP"></div><button class="btn" id="verifyOtp">Verify & sign in</button></div></div><div class="divider">OR CONTINUE WITH</div><button class="btn google" id="googleBtn">Continue with Google</button><div id="msg" class="msg" role="status"></div></section><div class="note">Protected dashboard · 8-hour secure session<br>Access is restricted to provisioned accounts only.</div></main><script>
+const msg=document.getElementById('msg');function say(t,ok=false){msg.style.color=ok?'#72dfa2':'#ff9d9d';msg.textContent=t}document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab,.panel').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.getElementById(b.dataset.tab).classList.add('active');say('')});async function post(url,data){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const j=await r.json();if(!r.ok||!j.ok)throw Error(j.error||'Request failed');return j}document.getElementById('passwordForm').onsubmit=async e=>{e.preventDefault();say('Signing in…');const f=new FormData(e.target);try{await post('/auth/login/password',{email:f.get('email'),password:f.get('password')});location.href='/'}catch(x){say(x.message)}};document.getElementById('sendOtp').onclick=async()=>{say('Sending verification code…');try{await post('/auth/login/otp/send',{phone:document.getElementById('phone').value});document.getElementById('otpArea').classList.remove('hidden');say('OTP sent. Check your SMS.',true)}catch(x){say(x.message)}};document.getElementById('verifyOtp').onclick=async()=>{say('Verifying…');try{await post('/auth/login/otp/verify',{phone:document.getElementById('phone').value,otp:document.getElementById('otp').value});location.href='/'}catch(x){say(x.message)}};document.getElementById('googleBtn').onclick=()=>location.href='/auth/google';
+</script></body></html>'''
+
+@app.before_request
+def _require_authentication():
+    allowed = {"login", "auth_password_login", "auth_otp_send", "auth_otp_verify", "auth_google", "auth_google_callback", "auth_logout", "health", "static"}
+    if request.endpoint in allowed or request.path == "/favicon.ico":
+        return None
+    if not _current_user():
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "error": "Authentication required", "login": "/login"}), 401
+        return redirect(url_for("login", next=request.path))
+    return None
+
+
+@app.route("/login")
+def login():
+    if _current_user(): return redirect("/")
+    return LOGIN_HTML
+
+
+@app.post("/auth/login/password")
+def auth_password_login():
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email", "")).strip().lower()
+    password = str(data.get("password", ""))
+    if not email or not password: return _json_error("Enter your email and password.")
+    with _auth_connect() as db:
+        user = db.execute("SELECT * FROM auth_users WHERE email=? AND is_active=1", (email,)).fetchone()
+    if not user or not user["password_hash"] or not check_password_hash(user["password_hash"], password):
+        return _json_error("Invalid email or password.", 401)
+    _login_user(user)
+    return jsonify({"ok": True})
+
+
+def _msg91_request(url, method="GET", payload=None):
+    authkey = os.environ.get("MSG91_AUTHKEY", "").strip()
+    if not authkey: raise RuntimeError("Mobile OTP is not configured. Set MSG91_AUTHKEY and MSG91_TEMPLATE_ID.")
+    body = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=body, method=method, headers={"authkey": authkey, "Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp: return json.loads(resp.read().decode() or "{}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="ignore")[:300]
+        raise RuntimeError("SMS provider rejected the OTP request: " + detail)
+
+
+@app.post("/auth/login/otp/send")
+def auth_otp_send():
+    data = request.get_json(silent=True) or {}
+    phone = re.sub(r"\D", "", str(data.get("phone", "")))
+    if len(phone) < 10 or len(phone) > 15: return _json_error("Enter a valid mobile number with country code.")
+    with _auth_connect() as db:
+        user = db.execute("SELECT id FROM auth_users WHERE phone=? AND is_active=1", (phone,)).fetchone()
+    if not user: return _json_error("This mobile number is not linked to an authorized account.", 404)
+    template = os.environ.get("MSG91_TEMPLATE_ID", "").strip()
+    if not template: return _json_error("Mobile OTP is not configured. Set MSG91_TEMPLATE_ID.", 503)
+    try:
+        query = urllib.parse.urlencode({"template_id": template, "mobile": phone, "otp_length": "6", "otp_expiry": "5"})
+        result = _msg91_request("https://control.msg91.com/api/v5/otp?" + query)
+        if str(result.get("type", "success")).lower() not in {"success", "successfully", ""}:
+            return _json_error("SMS provider could not send the OTP.", 502)
+        session["otp_phone"] = phone
+        return jsonify({"ok": True})
+    except Exception as exc: return _json_error(str(exc), 503)
+
+
+@app.post("/auth/login/otp/verify")
+def auth_otp_verify():
+    data = request.get_json(silent=True) or {}
+    phone = re.sub(r"\D", "", str(data.get("phone", "")))
+    otp = re.sub(r"\D", "", str(data.get("otp", "")))
+    if not phone or len(otp) != 6 or not hmac.compare_digest(phone, str(session.get("otp_phone", ""))):
+        return _json_error("Request a new OTP and enter the 6-digit code.")
+    try:
+        query = urllib.parse.urlencode({"mobile": phone, "otp": otp})
+        result = _msg91_request("https://control.msg91.com/api/v5/otp/verify?" + query)
+        if str(result.get("type", "")).lower() not in {"success", "successfully"}:
+            return _json_error("Invalid or expired OTP.", 401)
+        with _auth_connect() as db:
+            user = db.execute("SELECT * FROM auth_users WHERE phone=? AND is_active=1", (phone,)).fetchone()
+        if not user: return _json_error("Account is not authorized.", 403)
+        session.pop("otp_phone", None)
+        _login_user(user)
+        return jsonify({"ok": True})
+    except Exception as exc: return _json_error(str(exc), 503)
+
+
+@app.route("/auth/google")
+def auth_google():
+    client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret: return "Google sign-in is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.", 503
+    try:
+        from authlib.integrations.flask_client import OAuth
+        oauth = OAuth(app)
+        google = oauth.register(name="google", client_id=client_id, client_secret=client_secret,
+            server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+            client_kwargs={"scope": "openid email profile"})
+        session["google_oauth_ready"] = True
+        return google.authorize_redirect(url_for("auth_google_callback", _external=True))
+    except ImportError: return "Install Authlib in the dashboard virtualenv: pip install Authlib", 503
+
+
+@app.route("/auth/google/callback")
+def auth_google_callback():
+    if not session.pop("google_oauth_ready", False): return redirect("/login")
+    try:
+        from authlib.integrations.flask_client import OAuth
+        oauth = OAuth(app)
+        google = oauth.register(name="google", client_id=os.environ["GOOGLE_CLIENT_ID"], client_secret=os.environ["GOOGLE_CLIENT_SECRET"],
+            server_metadata_url="https://accounts.google.com/.well-known/openid-configuration", client_kwargs={"scope": "openid email profile"})
+        token = google.authorize_access_token()
+        info = token.get("userinfo") or google.userinfo()
+        email = str(info.get("email", "")).lower()
+        if not email or not info.get("email_verified"): return redirect("/login?error=google_email_unverified")
+        with _auth_connect() as db:
+            user = db.execute("SELECT * FROM auth_users WHERE email=? AND is_active=1", (email,)).fetchone()
+        if not user: return "Google account is not provisioned for BLACK dashboard access.", 403
+        _login_user(user)
+        return redirect("/")
+    except Exception as exc:
+        app.logger.exception("Google OAuth callback failed")
+        return "Google sign-in failed. Check OAuth configuration and callback URL.", 400
+
+
+@app.post("/auth/logout")
+@app.get("/auth/logout")
+def auth_logout():
+    session.clear()
+    return redirect("/login")
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1075,14 +1300,8 @@ def api_trade_ledger():
 
 @app.route("/health")
 def health():
-    return jsonify({
-        "ok": True,
-        "server_time": datetime.now().isoformat(timespec="seconds"),
-        "root_dir": str(ROOT_DIR),
-        "signals_log": SIGNALS_LOG.exists(),
-        "black_db": BLACK_DB.exists(),
-        "trades_db": LEDGER_PATH.exists(),
-    })
+    # Keep this public probe intentionally minimal; do not disclose filesystem paths.
+    return jsonify({"ok": True, "server_time": datetime.now().isoformat(timespec="seconds")})
 
 
 if __name__ == "__main__":
@@ -1101,4 +1320,4 @@ if __name__ == "__main__":
     print("║  /api/db_inspect   → BLACK SQLite tables + raw records             ║")
     print("║  /api/debug        → file/database health                           ║")
     print("╚══════════════════════════════════════════════════════════════════════╝")
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")), debug=False)
+    app.run(host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "8080")), debug=False, threaded=True, use_reloader=False)
