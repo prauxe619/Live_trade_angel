@@ -1041,12 +1041,12 @@ class FinNiftyCollector:
             iv_eligible = sum(bool(r.get("iv_valid")) for r in batch)
             quote_pct = quote_eligible / max(1, len(batch))
             iv_pct = iv_eligible / max(1, len(batch))
+
             if quote_pct < 0.50:
                 score -= 15
-                alerts.append(f"[{self.index_key}] Low eligible quote coverage: {quote_pct:.1%}")
             elif quote_pct < 0.75:
                 score -= 7
-                alerts.append(f"[{self.index_key}] Reduced eligible quote coverage: {quote_pct:.1%}")
+
             if iv_pct < 0.40:
                 score -= 10
 
