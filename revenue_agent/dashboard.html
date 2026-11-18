@@ -457,6 +457,23 @@ canvas#equityChart { width:100%; height:60px; display:block; }
   .ticker-bar { flex-wrap:wrap; }
   .engine-sidebar { max-height: none; }
 }
+
+
+.trade-day-header td {
+  background: var(--panel2, #202735);
+  color: var(--text1);
+  padding: 11px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  border-top: 1px solid var(--border, #344054);
+  border-bottom: 1px solid var(--border, #344054);
+}
+
+.trade-day-header strong {
+  color: var(--text1);
+  font-size: 12px;
+}
+
 </style>
 </head>
 <body>
@@ -979,62 +996,229 @@ function toggleTradeDetails(index) {
   if (row) row.style.display = row.style.display === 'none' ? 'table-row' : 'none';
 }
 
+
+function getTradeDateTime(s) {
+  // Prefer full timestamp, then known date/time fields.
+  const raw = s.timestamp || s.datetime || s.created_at || s.entry_time || '';
+
+  if (raw) {
+    const d = new Date(raw);
+    if (!Number.isNaN(d.getTime())) {
+      return d;
+    }
+  }
+
+  const date = s.date || s.trade_date || '';
+  const time = s.time || '';
+
+  if (date) {
+    const d = new Date(`${date}T${time || '00:00:00'}`);
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+
+  return null;
+}
+
+function getTradeDayKey(s) {
+  const d = getTradeDateTime(s);
+  if (!d) return 'unknown';
+
+  // Dashboard dates use India market time.
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).format(d);
+}
+
+function formatTradeDateTime(s) {
+  const d = getTradeDateTime(s);
+  if (!d) return '—';
+
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true
+  }).format(d);
+}
+
+function formatTradeDayHeading(dayKey) {
+  if (dayKey === 'unknown') return 'Date unavailable';
+
+  const d = new Date(`${dayKey}T00:00:00+05:30`);
+
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    weekday: 'long',
+    day: '2-digit',
+    month: 'long',
+    year: 'numeric'
+  }).format(d);
+}
+
+
+
 function renderTrades(signals) {
   const body = document.getElementById('tradesBody');
-  document.getElementById('tradeCount').textContent = allSignals.length + ' signals';
+  document.getElementById('tradeCount').textContent =
+    allSignals.length + ' signals';
 
   if (!signals.length) {
     body.innerHTML = `
       <div class="empty-state">
         <div class="icon">📭</div>
-        <div class="msg">No trades in this category.<br>Engine fires when setups confirm.</div>
+        <div class="msg">No trades in this category.<br>
+          Engine fires when setups confirm.</div>
       </div>`;
     return;
   }
 
-  const newIds = new Set(signals.map(s => s.signal_id || s.id || (s.timestamp + s.index)));
-  let html = `<table class="trades-table"><thead><tr>
-    <th>Time</th><th>Index</th><th>Type</th><th>Dir</th>
-    <th>Strike</th><th>Entry</th><th>Exit</th>
-    <th>P&L pts</th><th>₹ P&L</th><th>Prob</th><th>Status</th><th>Manage</th>
-  </tr></thead><tbody>`;
+  const newIds = new Set(
+    signals.map(s => String(
+      s.signal_id || s.id || (s.timestamp + s.index)
+    ))
+  );
+
+  let html = `
+    <table class="trades-table">
+      <thead>
+        <tr>
+          <th>Date / Time</th>
+          <th>Index</th>
+          <th>Type</th>
+          <th>Dir</th>
+          <th>Strike</th>
+          <th>Entry</th>
+          <th>Exit</th>
+          <th>P&L pts</th>
+          <th>₹ P&L</th>
+          <th>Prob</th>
+          <th>Status</th>
+          <th>Manage</th>
+        </tr>
+      </thead>
+      <tbody>`;
+
+  // Group trades by Indian market date.
+  const groupedTrades = {};
 
   for (const s of signals) {
-    const id = s.signal_id || s.id || (s.timestamp + s.index);
-    const index = allSignals.indexOf(s);
-    const isNew = !prevIds.has(String(id));
-    const dir = (s.direction || '').toUpperCase();
-    const pnlPts = Number(s.pnl_pts || 0);
-    const pnlInr = Number(s.pnl_inr || s.rupee_pnl || 0);
-    const pnlCls = pnlPts > 0 ? 'pnl-pos' : (pnlPts < 0 ? 'pnl-neg' : 'pnl-neu');
-    const time = String(s.timestamp || '').slice(11,16) || String(s.time || '').slice(0,5);
-    const entry = Number(s.entry_price || s.entry || 0);
-    const exit  = Number(s.exit_price  || s.exit  || 0);
-    const prob  = Number(s.prob || 0);
-    const rowCls = getRowClass(s) + (isNew ? ' new-row' : '');
+    const dayKey = getTradeDayKey(s);
 
-    html += `<tr class="${rowCls}">
-      <td style="color:var(--text2);font-size:10px">${escapeHTML(time || '—')}</td>
-      <td style="font-weight:600;font-size:11px">${escapeHTML(s.index || s.label || '—')}</td>
-      <td>${getSignalTypeBadge(s.signal_type, s.channel)}</td>
-      <td class="${dir==='CE'?'badge-ce':'badge-pe'}">${escapeHTML(dir || '—')}</td>
-      <td style="color:var(--text1)">${escapeHTML(s.strike || '—')}</td>
-      <td>${entry > 0 ? '₹'+entry.toFixed(1) : '—'}</td>
-      <td>${exit  > 0 ? '₹'+exit.toFixed(1)  : '—'}</td>
-      <td class="${pnlCls}">${FPts(pnlPts)}</td>
-      <td class="${pnlCls}">${pnlInr !== 0 ? FI(pnlInr) : '—'}</td>
-      <td style="color:var(--text2);font-size:10px">${prob ? (Math.abs(prob)*100).toFixed(0)+'%' : '—'}</td>
-      <td>${getStatusBadge(s)}</td>
-      <td><button class="detail-toggle" onclick="toggleTradeDetails(${index})">Targets / SL</button></td>
-    </tr>
-    <tr class="trade-detail-row" id="trade-detail-${index}" style="display:none">
-      <td colspan="12">${renderTradeDetails(s)}</td>
-    </tr>`;
+    if (!groupedTrades[dayKey]) {
+      groupedTrades[dayKey] = [];
+    }
+
+    groupedTrades[dayKey].push(s);
   }
+
+  // Newest trading date first.
+  const sortedDays = Object.keys(groupedTrades).sort((a, b) => {
+    if (a === 'unknown') return 1;
+    if (b === 'unknown') return -1;
+    return b.localeCompare(a);
+  });
+
+  for (const dayKey of sortedDays) {
+    const dayTrades = groupedTrades[dayKey];
+
+    // Sort trades within each day, newest first.
+    dayTrades.sort((a, b) => {
+      const da = getTradeDateTime(a);
+      const db = getTradeDateTime(b);
+
+      if (!da && !db) return 0;
+      if (!da) return 1;
+      if (!db) return -1;
+
+      return db.getTime() - da.getTime();
+    });
+
+    const dayPnl = dayTrades.reduce(
+      (sum, s) => sum + Number(s.pnl_inr || s.rupee_pnl || 0),
+      0
+    );
+
+    html += `
+      <tr class="trade-day-header">
+        <td colspan="12">
+          <strong>📅 ${escapeHTML(formatTradeDayHeading(dayKey))}</strong>
+          <span style="float:right">
+            ${dayTrades.length} trades
+            &nbsp; | &nbsp;
+            P&L: ${FI(dayPnl)}
+          </span>
+        </td>
+      </tr>`;
+
+    for (const s of dayTrades) {
+      const id = s.signal_id || s.id || (s.timestamp + s.index);
+      const index = allSignals.indexOf(s);
+      const isNew = !prevIds.has(String(id));
+
+      const dir = (s.direction || '').toUpperCase();
+      const pnlPts = Number(s.pnl_pts || 0);
+      const pnlInr = Number(s.pnl_inr || s.rupee_pnl || 0);
+
+      const pnlCls = pnlPts > 0
+        ? 'pnl-pos'
+        : pnlPts < 0 ? 'pnl-neg' : 'pnl-neu';
+
+      const time = formatTradeDateTime(s);
+      const entry = Number(s.entry_price || s.entry || 0);
+      const exit = Number(s.exit_price || s.exit || 0);
+      const prob = Number(s.prob || 0);
+
+      const rowCls = getRowClass(s) + (isNew ? ' new-row' : '');
+
+      html += `
+        <tr class="${rowCls}">
+          <td style="color:var(--text2);font-size:10px;white-space:nowrap">
+            ${escapeHTML(time)}
+          </td>
+          <td style="font-weight:600;font-size:11px">
+            ${escapeHTML(s.index || s.label || '—')}
+          </td>
+          <td>${getSignalTypeBadge(s.signal_type, s.channel)}</td>
+          <td class="${dir === 'CE' ? 'badge-ce' : 'badge-pe'}">
+            ${escapeHTML(dir || '—')}
+          </td>
+          <td style="color:var(--text1)">
+            ${escapeHTML(s.strike || '—')}
+          </td>
+          <td>${entry > 0 ? '₹' + entry.toFixed(1) : '—'}</td>
+          <td>${exit > 0 ? '₹' + exit.toFixed(1) : '—'}</td>
+          <td class="${pnlCls}">${FPts(pnlPts)}</td>
+          <td class="${pnlCls}">${pnlInr !== 0 ? FI(pnlInr) : '—'}</td>
+          <td style="color:var(--text2);font-size:10px">
+            ${prob ? (Math.abs(prob) * 100).toFixed(0) + '%' : '—'}
+          </td>
+          <td>${getStatusBadge(s)}</td>
+          <td>
+            <button class="detail-toggle"
+              onclick="toggleTradeDetails(${index})">
+              Targets / SL
+            </button>
+          </td>
+        </tr>
+
+        <tr class="trade-detail-row"
+            id="trade-detail-${index}" style="display:none">
+          <td colspan="12">${renderTradeDetails(s)}</td>
+        </tr>`;
+    }
+  }
+
   html += '</tbody></table>';
   body.innerHTML = html;
   prevIds = newIds;
 }
+
 
 
 // ── STATS ────────────────────────────────────────────────
