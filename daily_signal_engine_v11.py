@@ -96,6 +96,20 @@ TRADE_LOTS = int(os.getenv("TRADE_LOTS", "1"))
 if TRADE_LOTS < 1:
     raise ValueError("TRADE_LOTS must be an integer >= 1")
 
+def _display_trade_lots(index_key: str) -> int:
+    """
+    Lot count for engine P&L estimates.
+    Live mode uses per-index allocation.
+    Paper mode retains the existing TRADE_LOTS setting.
+    """
+    if os.getenv("TRADING_MODE", "paper").strip().lower() == "live":
+        from trading_live.lot_config import configured_live_lots
+        return configured_live_lots(
+            index_key,
+            fallback=TRADE_LOTS,
+        )
+
+    return TRADE_LOTS
 # ── Optional Angel One SDK ────────────────────────────────────────────────────
 try:
     from SmartApi import SmartConnect
@@ -3875,7 +3889,10 @@ class TargetMonitor:
 
             if sig.sl_price >= sig.entry_premium:
                 # Trailed SL — secured profit
-                trade_profit = round((curr - sig.entry_premium) * lot * TRADE_LOTS)
+                trade_lots = _display_trade_lots(sig.index_key)
+                trade_profit = round(
+                    (curr - sig.entry_premium) * lot * trade_lots
+                )
                 if not sig.is_free_signal:
                     if trade_profit > 0:
                         header = f"🛡️ <b>TRAILED SL HIT (PROFIT SECURED) — {cfg['label']}</b>"
@@ -3903,7 +3920,10 @@ class TargetMonitor:
                 _log.info(f"Trailed SL (profit): {sig.signal_id}  ₹{trade_profit}")
             else:
                 # Normal SL hit — loss
-                trade_loss = round((sig.entry_premium - curr) * lot * TRADE_LOTS)
+                trade_lots = _display_trade_lots(sig.index_key)
+                trade_loss = round(
+                    (sig.entry_premium - curr) * lot * trade_lots
+                )
                 if not sig.is_free_signal:
                     _to_vip(Fmt.vip_sl_hit(
                         cfg, sig.strike, sig.direction, expiry,
@@ -3937,7 +3957,10 @@ class TargetMonitor:
                         continue
                     sig.active = False
 
-                trade_profit = round((curr - sig.entry_premium) * sig.lot_size * TRADE_LOTS)
+                trade_lots = _display_trade_lots(sig.index_key)
+                trade_profit = round(
+                    (curr - sig.entry_premium) * sig.lot_size * trade_lots
+                )
                 cfg = INDICES[sig.index_key]
                 de  = "🟢" if sig.direction == "CE" else "🔴"
                 _to_vip(

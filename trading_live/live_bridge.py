@@ -13,7 +13,7 @@ from __future__ import annotations
 import os, json, math, time, hashlib, logging, threading, urllib.request, urllib.parse
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
+from .lot_config import configured_live_lots
 from .angel_one_broker import (AngelOneBroker, BrokerSafetyError, OrderOutcomeUnknown,
                                tick, kill_switch_on, engine_expiry_to_master)
 from .live_state import MemoryStore, PgStore, list_active, today_ist
@@ -431,16 +431,31 @@ class LiveBridge:
                 lot = int(contract.get("lotsize") or 0)
                 engine_lot = int(sig["lot_size"])
                 qty = int(sig["quantity"])
-                trade_lots = int(sig.get("trade_lots", self.cfg.trade_lots))
+                trade_lots = int(sig.get("trade_lots", 0))
+
+                configured_lots = configured_live_lots(
+                    sig["index"],
+                    fallback=self.cfg.trade_lots,
+                )
+
                 max_live_lots = int(os.getenv("LIVE_MAX_LOTS_PER_TRADE", "1"))
+
+                if configured_lots == 0:
+                    raise BrokerSafetyError(
+                        f"Live trading disabled for index {sig['index']}"
+                    )
+
                 if max_live_lots < 1 or trade_lots > max_live_lots:
                     raise BrokerSafetyError(
-                        f"Trade size {trade_lots} lots exceeds LIVE_MAX_LOTS_PER_TRADE={max_live_lots}"
+                        f"Trade size {trade_lots} lots exceeds "
+                        f"LIVE_MAX_LOTS_PER_TRADE={max_live_lots}"
                     )
-                if trade_lots != self.cfg.trade_lots or qty != lot * trade_lots:
+
+                if trade_lots != configured_lots or qty != lot * trade_lots:
                     raise BrokerSafetyError(
-                        f"Quantity/trade-lot mismatch: engine_qty={qty}, contract_lot={lot}, "
-                        f"engine_lots={trade_lots}, bridge_lots={self.cfg.trade_lots}"
+                        f"Quantity/trade-lot mismatch: "
+                        f"engine_qty={qty}, contract_lot={lot}, "
+                        f"engine_lots={trade_lots}, configured_lots={configured_lots}"
                     )
                 snapshot_age = float(sig["snapshot_age_s"])
                 if (not math.isfinite(snapshot_age) or snapshot_age < -2

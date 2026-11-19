@@ -4,6 +4,7 @@
 import logging
 import math
 import os
+from trading_live.lot_config import configured_live_lots
 
 log = logging.getLogger("black.engine_hooks")
 
@@ -66,8 +67,22 @@ def submit_engine_entry(sig, fetcher, trade_lots=1):
         if x.strip()
     }
 
+    
     if strategy not in allowed:
         return skip(f"STRATEGY_NOT_ALLOWLISTED:{strategy}")
+
+    # Resolve live lot quantity separately for each index.
+    try:
+        live_lots = configured_live_lots(
+            sig.index_key,
+            fallback=trade_lots,
+        )
+    except (TypeError, ValueError) as exc:
+        return skip(f"INVALID_INDEX_LOT_CONFIG:{exc}")
+
+    # Zero means: do not open NEW live positions for this index.
+    if live_lots == 0:
+        return skip("INDEX_DISABLED")
 
     try:
         quote = fetcher.get_option_quote(
@@ -76,6 +91,7 @@ def submit_engine_entry(sig, fetcher, trade_lots=1):
             sig.direction,
             sig.expiry,
         )
+
     except Exception as exc:
         raise RuntimeError(
             f"LIVE ENTRY BLOCKED: quote_fetch_error:{type(exc).__name__}:{exc}"
@@ -115,8 +131,8 @@ def submit_engine_entry(sig, fetcher, trade_lots=1):
         "sl_price": float(sig.sl_price),
         "signal_type": strategy,
         "lot_size": int(sig.lot_size),
-        "quantity": int(sig.lot_size) * int(trade_lots),
-        "trade_lots": int(trade_lots),
+        "quantity": int(sig.lot_size) * live_lots,
+        "trade_lots": live_lots,
         "snapshot_age_s": snapshot_age,
     }
 
