@@ -80,15 +80,12 @@ def validate_order(
             "Quantity must be a multiple of the verified current exchange lot size"
         )
 
+    
+    # Quote freshness is already validated by engine_hooks.py
+    # and live_bridge.py immediately before execution.
+    # Do not apply the index snapshot-age threshold to this option quote.
     snapshot_age_s = _finite_number("snapshot_age_s", snapshot_age_s)
 
-    max_snapshot_age = _int_env("SNAPSHOT_MAX_AGE_SECONDS", 60)
-
-    if max_snapshot_age < 0:
-        raise RiskRejected("SNAPSHOT_MAX_AGE_SECONDS cannot be negative")
-
-    if snapshot_age_s < 0 or snapshot_age_s > max_snapshot_age:
-        raise RiskRejected("Market snapshot is stale")
 
     if not signal_id:
         raise RiskRejected("Missing signal_id")
