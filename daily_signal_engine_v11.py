@@ -3761,8 +3761,20 @@ class TargetMonitor:
             if is_final:
                 sig.moonbag = True
                 sig.peak = max(sig.peak, curr)
-                # Preserve the existing T2/T2.5 stop. ATR/swing may only ratchet it higher.
+
+                # Final Target: move SL to Target 2.5.
+                # Never lower an already higher stop.
+                t2_5_price = float(sig.targets[2]["price"])
+                old_sl = float(sig.sl_price)
+                sig.sl_price = max(old_sl, t2_5_price)
+
                 sig._moonbag_last_refresh = 0.0
+
+                if sig.sl_price > old_sl:
+                    _log.info(
+                        "MOONBAG START: SL upgraded from ₹%.1f to T2.5 ₹%.1f",
+                        old_sl, sig.sl_price
+                    )
                 locked = round((sig.sl_price - sig.entry_premium) * lot * TRADE_LOTS)
                 if not sig.is_free_signal:
                     _to_vip(Fmt.vip_moonbag_start(
