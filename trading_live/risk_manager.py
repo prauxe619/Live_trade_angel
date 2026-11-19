@@ -57,8 +57,8 @@ def validate_order(
     open_positions and daily_realized_pnl remain in the function signature
     for compatibility with existing live_bridge.py callers.
 
-    Position count and daily P&L limits are deliberately not enforced here.
-    The signal engine owns those decisions.
+    Live execution requires explicit account-level caps. Missing caps fail
+    closed; they are not guessed from account balance or strategy settings.
     """
 
     trading_mode = os.getenv("TRADING_MODE", "paper").strip().lower()
@@ -96,6 +96,28 @@ def validate_order(
     if signal_id in existing_signal_ids:
         raise RiskRejected("Duplicate signal_id")
 
+    try:
+        max_open_positions = _int_env("LIVE_MAX_OPEN_POSITIONS", 0)
+        max_daily_loss = _finite_number(
+            "LIVE_MAX_DAILY_LOSS_INR", os.getenv("LIVE_MAX_DAILY_LOSS_INR", "nan")
+        )
+        realized = _finite_number("daily_realized_pnl", daily_realized_pnl)
+    except RiskRejected:
+        raise
+
+    if max_open_positions < 1:
+        raise RiskRejected("LIVE_MAX_OPEN_POSITIONS must be configured to a positive integer")
+    if max_daily_loss <= 0:
+        raise RiskRejected("LIVE_MAX_DAILY_LOSS_INR must be configured to a positive amount")
+    if int(open_positions) >= max_open_positions:
+        raise RiskRejected(
+            f"Maximum concurrent live positions reached ({open_positions}/{max_open_positions})"
+        )
+    if realized <= -max_daily_loss:
+        raise RiskRejected(
+            f"Daily realized loss limit reached (P&L ₹{realized:,.2f}; limit ₹{max_daily_loss:,.2f})"
+        )
+
     now = now or datetime.now(IST)
 
     if now.tzinfo is None:
@@ -130,6 +152,9 @@ def validate_order(
         "approved": True,
         "quantity": quantity,
         "lot_size": lot_size,
+        "max_open_positions": max_open_positions,
+        "daily_loss_limit_inr": max_daily_loss,
+        "daily_realized_pnl": realized,
         "checked_at": now.isoformat(),
     }
 
@@ -140,6 +165,8 @@ def validate_live_extras(
     stop_price: float,
     quantity: int,
     available_cash: float,
+    daily_realized_pnl: float = 0.0,
+    open_risk_rupees: float = 0.0,
 ) -> dict:
     """Validate price, quantity and available funds.
 
@@ -174,8 +201,32 @@ def validate_live_extras(
     if not math.isfinite(planned_risk) or not math.isfinite(premium_outlay):
         raise RiskRejected("Non-finite trade calculation")
 
+    max_trade_risk = _finite_number(
+        "LIVE_MAX_TRADE_RISK_INR", os.getenv("LIVE_MAX_TRADE_RISK_INR", "nan")
+    )
+    if max_trade_risk <= 0:
+        raise RiskRejected("LIVE_MAX_TRADE_RISK_INR must be configured to a positive amount")
+    if planned_risk > max_trade_risk:
+        raise RiskRejected(
+            f"Planned trade risk ₹{planned_risk:,.2f} exceeds configured cap ₹{max_trade_risk:,.2f}"
+        )
+
+    daily_realized_pnl = _finite_number("daily_realized_pnl", daily_realized_pnl)
+    open_risk_rupees = _finite_number("open_risk_rupees", open_risk_rupees)
+    if open_risk_rupees < 0:
+        raise RiskRejected("open_risk_rupees cannot be negative")
+    max_daily_loss = _finite_number(
+        "LIVE_MAX_DAILY_LOSS_INR", os.getenv("LIVE_MAX_DAILY_LOSS_INR", "nan")
+    )
+    worst_case_daily_pnl = daily_realized_pnl - open_risk_rupees - planned_risk
+    if worst_case_daily_pnl < -max_daily_loss:
+        raise RiskRejected(
+            f"Aggregate worst-case daily P&L ₹{worst_case_daily_pnl:,.2f} would breach "
+            f"daily loss cap ₹{max_daily_loss:,.2f} (open risk ₹{open_risk_rupees:,.2f}, "
+            f"new risk ₹{planned_risk:,.2f})"
+        )
+
     # Funds check is retained as an execution-integrity check.
-    # No maximum premium or maximum trade-loss cap is applied.
     required_cash = premium_outlay * 1.05
 
     if not math.isfinite(required_cash):
@@ -189,6 +240,9 @@ def validate_live_extras(
 
     return {
         "risk_rupees": round(planned_risk, 2),
+        "open_risk_rupees": round(open_risk_rupees, 2),
+        "worst_case_daily_pnl": round(worst_case_daily_pnl, 2),
+        "max_trade_risk_inr": max_trade_risk,
         "outlay_rupees": round(premium_outlay, 2),
         "required_cash": round(required_cash, 2),
     }

@@ -145,6 +145,134 @@ class LiveBridge:
         pos["updated"] = self.clock().isoformat()
         self.store.put(pos)
 
+    def has_live_position(self, signal_id: str) -> bool:
+        """Return whether this signal has a broker-managed or unresolved position.
+
+        Signals skipped/rejected in paper mode must not later issue broker SELLs.
+        Unknown statuses remain managed (fail closed) unless explicitly known to
+        represent no live fill.
+        """
+        pos = self.store.get(str(signal_id))
+        status = str((pos or {}).get("status") or "").upper()
+        no_live_fill = status in {
+            "SHADOW", "REJECTED", "ENTRY_FAILED", "DUPLICATE_BLOCKED",
+            "CLOSED", "CLOSED_UNPRICED",
+        }
+        if pos and not no_live_fill:
+            return True
+
+        # Atomic ENTRY claims normally create the position row and intent in
+        # one transaction. If an older deployment left an orphan intent, do
+        # not silently classify it as paper-only: an order may have reached
+        # Angel One even though the position row is absent.
+        if hasattr(self.store, "_connect"):
+            with self.store._connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """SELECT status, broker_order_id FROM live_order_intents
+                       WHERE signal_id=%s AND action='ENTRY'
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (str(signal_id),),
+                )
+                intent = cur.fetchone()
+            if intent:
+                intent_status = str(intent[0] or "").lower()
+                if intent_status in {"submitting", "unknown", "open", "partial", "complete"}:
+                    return True
+        return False
+
+    @staticmethod
+    def _order_matches_contract(order: dict, contract: dict) -> bool:
+        if str(order.get("exchange") or "").upper() != str(contract.get("exchange") or "").upper():
+            return False
+        row_token = str(order.get("symboltoken") or "")
+        row_symbol = str(order.get("symbol") or order.get("tradingsymbol") or "")
+        token = str(contract.get("symboltoken") or "")
+        symbol = str(contract.get("tradingsymbol") or "")
+        if row_token and token and row_symbol and symbol:
+            return row_token == token and row_symbol == symbol
+        return bool((row_token and token and row_token == token) or
+                    (row_symbol and symbol and row_symbol == symbol))
+
+    def _emergency_exit_if_unprotected(self, pos, reason="STOP_PROTECTION_FAILED"):
+        """Flatten only after repeated broker snapshots prove no active SELL exists.
+
+        This is deliberately conservative: any active/unknown SELL on the exact
+        contract, a missing known stop order, an unreadable position, or a
+        quantity mismatch blocks the emergency SELL rather than risking a short.
+        """
+        contract = pos["contract"]
+        orders = None
+        net_qty = None
+        stop_filled = 0
+        for attempt in range(3):
+            try:
+                orders = self.broker.orders()
+                net_qty = int(self.broker.net_qty(contract))
+            except (BrokerSafetyError, TypeError, ValueError, OverflowError) as exc:
+                pos.update(status="STOP_UNKNOWN", error=f"Cannot verify missing protective stop before emergency exit: {exc}")
+                self._save(pos)
+                self._alert(f"UNPROTECTED POSITION {pos['signal_id']}: broker state unavailable; manual intervention required")
+                return pos
+
+            matching = [o for o in orders if self._order_matches_contract(o, contract)]
+            active_sells = [o for o in matching if o.get("side") == "SELL" and o.get("status") not in TERMINAL]
+            if active_sells:
+                ids = ",".join(str(o.get("order_id") or "?" ) for o in active_sells)
+                pos.update(status="STOP_UNKNOWN", error=f"Active SELL order(s) exist on contract ({ids}); refusing emergency duplicate SELL")
+                self._save(pos)
+                self._alert(f"UNPROTECTED POSITION {pos['signal_id']}: active SELL order requires reconciliation; no duplicate SELL sent")
+                return pos
+
+            known_stop_id = str(pos.get("sl_order_id") or "")
+            if known_stop_id:
+                known = next((o for o in orders if str(o.get("order_id") or "") == known_stop_id), None)
+                if known is None:
+                    pos.update(status="STOP_UNKNOWN", error=f"Known STOP {known_stop_id} is absent from broker order book; refusing emergency SELL")
+                    self._save(pos)
+                    self._alert(f"UNPROTECTED POSITION {pos['signal_id']}: known STOP cannot be reconciled; manual intervention required")
+                    return pos
+                if not self._order_matches_contract(known, contract):
+                    pos.update(status="STOP_UNKNOWN", error=f"Known STOP {known_stop_id} belongs to a different contract")
+                    self._save(pos)
+                    self._alert(f"STOP CONTRACT MISMATCH {pos['signal_id']}: manual intervention required")
+                    return pos
+
+            stop_filled = sum(
+                max(0, int(o.get("filled") or 0))
+                for o in matching
+                if o.get("side") == "SELL"
+                and str(o.get("variety") or "").upper() == "STOPLOSS"
+                and str(o.get("tag") or "") == str(pos.get("tag") or "")
+            )
+            expected = max(0, int(pos.get("qty") or 0) - stop_filled)
+            if net_qty < 0 or net_qty != expected:
+                pos.update(status="STOP_UNKNOWN", error=f"Emergency-exit quantity mismatch: expected broker net {expected}, actual {net_qty}")
+                self._save(pos)
+                self._alert(f"STOP RECOVERY BLOCKED {pos['signal_id']}: quantity mismatch; manual intervention required")
+                return pos
+
+            if attempt < 2:
+                self.sleep(1.0)
+
+        if net_qty == 0:
+            return self._finalize(pos, reason)
+
+        pos.update(status="OPEN", remaining_qty=net_qty,
+                   error="No active protective SELL confirmed after repeated broker snapshots; emergency flattening")
+        self._save(pos)
+        self._alert(f"PROTECTIVE STOP MISSING {pos['signal_id']}: emergency market exit for broker-held quantity {net_qty}")
+        return self._exit_locked(pos, reason)
+
+    def _refresh_and_reconcile_stop(self, pos):
+        try:
+            book = {str(o.get("order_id")): o for o in self.broker.orders() if o.get("order_id")}
+            return self._reconcile_stop(pos, book)
+        except Exception as exc:
+            pos.update(status="STOP_UNKNOWN", error=f"STOP order-book reconciliation failed: {exc}")
+            self._save(pos)
+            self._alert(f"STOP UNKNOWN for {pos['signal_id']}: broker order book could not be reconciled")
+            return pos
+
     def _poll(self, order_id, done, timeout_s, interval=0.5):
         n = max(1, int(math.ceil(timeout_s / interval)))
         info = None
@@ -178,9 +306,72 @@ class LiveBridge:
         from .live_state import realized_pnl_today
         active = list_active(self.store)
         try:
+            # Count all open NFO/BFO derivative contracts from Angel One, not
+            # only this bot's rows. Manual positions must consume the same
+            # concurrent-position allowance.
+            position_rows = self.broker.position_book()
+            net_by_contract = {}
+            for row in position_rows:
+                exchange = str(row.get("exchange") or "").upper()
+                if exchange not in {"NFO", "BFO"}:
+                    continue
+                raw_qty = row.get("netqty")
+                try:
+                    numeric_qty = float(raw_qty)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise BrokerSafetyError("Malformed derivative net quantity in broker position book") from exc
+                if not math.isfinite(numeric_qty) or not numeric_qty.is_integer():
+                    raise BrokerSafetyError("Non-integer derivative net quantity in broker position book")
+                token = str(row.get("symboltoken") or "")
+                symbol = str(row.get("tradingsymbol") or row.get("symbol") or "")
+                if numeric_qty != 0 and not (token or symbol):
+                    raise BrokerSafetyError("Open derivative position is missing contract identity")
+                key = (exchange, token, symbol)
+                net_by_contract[key] = net_by_contract.get(key, 0) + int(numeric_qty)
+            broker_open_positions = sum(1 for qty in net_by_contract.values() if qty != 0)
+            if broker_open_positions != len(active):
+                raise BrokerSafetyError(
+                    "Broker derivative positions do not match bot-managed live positions; "
+                    "unmanaged/manual exposure or unresolved reconciliation detected"
+                )
+            open_positions = broker_open_positions
+            daily_pnl = realized_pnl_today(self.store)
+            open_risk = 0.0
+            for live_pos in active:
+                if live_pos.get("status") != "OPEN" or not live_pos.get("sl_order_id"):
+                    raise BrokerSafetyError(
+                        f"Existing live position {live_pos.get('signal_id')} is not confirmed OPEN with a broker stop"
+                    )
+                try:
+                    live_entry = float(live_pos.get("entry_avg"))
+                    live_stop = float(live_pos.get("sl_trigger"))
+                    live_qty = int(live_pos.get("qty"))
+                    stop_order = self.broker.get_order(str(live_pos["sl_order_id"]))
+                    broker_net = int(self.broker.net_qty(live_pos["contract"]))
+                except (BrokerSafetyError, TypeError, ValueError, OverflowError) as exc:
+                    raise BrokerSafetyError(f"Existing live position reconciliation failed: {exc}") from exc
+                if (not math.isfinite(live_entry) or not math.isfinite(live_stop)
+                        or live_entry <= 0 or live_stop <= 0 or live_qty <= 0):
+                    raise BrokerSafetyError("Existing live position has non-finite or non-positive risk fields")
+                if (not stop_order
+                        or stop_order.get("status") not in {"open", "trigger_pending"}
+                        or stop_order.get("side") != "SELL"
+                        or str(stop_order.get("variety") or "").upper() != "STOPLOSS"
+                        or not self._order_matches_contract(stop_order, live_pos["contract"])
+                        or str(stop_order.get("tag") or "") != str(live_pos.get("tag") or "")):
+                    raise BrokerSafetyError(
+                        f"Existing live position {live_pos.get('signal_id')} has no confirmed active tagged protective stop"
+                    )
+                remaining = int(stop_order.get("quantity") or 0) - int(stop_order.get("filled") or 0)
+                if remaining != broker_net or broker_net != live_qty or float(stop_order.get("trigger") or 0) <= 0:
+                    raise BrokerSafetyError(
+                        f"Existing live position {live_pos.get('signal_id')} stop/position quantity mismatch"
+                    )
+                open_risk += max(0.0, live_entry - live_stop) * live_qty
+
             order_check = validate_order(
                 quantity=int(quantity), lot_size=int(lot_size),
-                open_positions=len(active), daily_realized_pnl=realized_pnl_today(self.store),
+                open_positions=open_positions, daily_realized_pnl=daily_pnl,
                 snapshot_age_s=float(snapshot_age_s), signal_id=str(signal_id),
                 existing_signal_ids={str(p.get("signal_id")) for p in active},
                 now=self.clock(),
@@ -189,6 +380,7 @@ class LiveBridge:
             money_check = validate_live_extras(
                 entry_price=float(entry_price), stop_price=float(stop_price),
                 quantity=int(quantity), available_cash=available_cash,
+                daily_realized_pnl=daily_pnl, open_risk_rupees=open_risk,
             )
         except RiskRejected as exc:
             raise BrokerSafetyError(f"Pre-trade risk rejected: {exc}") from exc
@@ -240,6 +432,11 @@ class LiveBridge:
                 engine_lot = int(sig["lot_size"])
                 qty = int(sig["quantity"])
                 trade_lots = int(sig.get("trade_lots", self.cfg.trade_lots))
+                max_live_lots = int(os.getenv("LIVE_MAX_LOTS_PER_TRADE", "1"))
+                if max_live_lots < 1 or trade_lots > max_live_lots:
+                    raise BrokerSafetyError(
+                        f"Trade size {trade_lots} lots exceeds LIVE_MAX_LOTS_PER_TRADE={max_live_lots}"
+                    )
                 if trade_lots != self.cfg.trade_lots or qty != lot * trade_lots:
                     raise BrokerSafetyError(
                         f"Quantity/trade-lot mismatch: engine_qty={qty}, contract_lot={lot}, "
@@ -267,10 +464,14 @@ class LiveBridge:
                 if not math.isfinite(paper_entry) or paper_entry <= 0:
                     raise BrokerSafetyError("Invalid engine entry premium")
 
-                dev = abs(ltp - paper_entry) / paper_entry * 100
+                # The BUY is a marketable LIMIT above LTP. Validate the
+                # worst permitted fill (the actual limit), not just the quote,
+                # so both price deviation and planned risk remain bounded.
+                worst_entry_price = tick(ltp * (1 + self.cfg.entry_buffer_pct / 100))
+                dev = abs(worst_entry_price - paper_entry) / paper_entry * 100
                 if dev > self.cfg.max_entry_dev_pct:
                     raise BrokerSafetyError(
-                        f"Execution price deviation {dev:.2f}% exceeds configured execution tolerance"
+                        f"Maximum permitted execution price deviation {dev:.2f}% exceeds configured tolerance"
                     )
 
                 sl_price = float(sig["sl_price"])
@@ -280,7 +481,7 @@ class LiveBridge:
                 if not self.cfg.shadow:
                     pos["pretrade_risk"] = self._validate_pretrade_risk(
                         signal_id=sid, quantity=qty, lot_size=lot,
-                        snapshot_age_s=snapshot_age, entry_price=ltp,
+                        snapshot_age_s=snapshot_age, entry_price=worst_entry_price,
                         stop_price=sl_price,
                     )
 
@@ -409,8 +610,36 @@ class LiveBridge:
             return pos
 
         filled = int(info["filled"])
-        pos.update(qty=filled, entry_avg=info["avg"] or ltp, status="OPEN")
+        entry_avg = float(info.get("avg") or ltp)
+        if not math.isfinite(entry_avg) or entry_avg <= 0:
+            pos.update(status="UNKNOWN_ENTRY", qty=filled,
+                       error="Entry fill price is missing/invalid; broker position requires reconciliation")
+            self._save(pos)
+            self._alert(f"ENTRY {oid}: fill price is invalid; protective stop not submitted until reconciled")
+            return pos
+        pos.update(qty=filled, entry_avg=entry_avg, status="OPEN")
         self._save(pos)
+
+        # Recheck actual fill risk before placing protection. The pre-trade
+        # check used the maximum BUY limit; this catches malformed broker fills
+        # or any fill outside the expected limit.
+        try:
+            max_trade_risk = float(os.getenv("LIVE_MAX_TRADE_RISK_INR", "nan"))
+        except (TypeError, ValueError, OverflowError):
+            max_trade_risk = float("nan")
+        actual_risk = (entry_avg - float(sl_price)) * filled
+        if not math.isfinite(max_trade_risk) or max_trade_risk <= 0:
+            pos.update(status="UNKNOWN_ENTRY", error="LIVE_MAX_TRADE_RISK_INR missing/invalid after fill")
+            self._save(pos)
+            self._alert(f"ENTRY {oid}: risk cap unavailable after fill; immediate manual reconciliation required")
+            return pos
+        if entry_avg <= float(sl_price) or actual_risk > max_trade_risk:
+            reason = "ENTRY_FILLED_AT_OR_BELOW_STOP" if entry_avg <= float(sl_price) else "FILLED_RISK_LIMIT_EXCEEDED"
+            pos.update(error=f"{reason}: entry_avg={entry_avg:.2f}, stop={float(sl_price):.2f}, risk={actual_risk:.2f}, cap={max_trade_risk:.2f}")
+            self._save(pos)
+            self._alert(f"ENTRY {oid}: {reason}; flattening verified broker quantity immediately")
+            self._exit_locked(pos, reason)
+            return self.store.get(pos["signal_id"]) or pos
 
         # Never protect a fill based only on the order book. Confirm exact broker net
         # quantity first; mismatch or unreadable positions leaves it UNKNOWN_ENTRY.
@@ -480,7 +709,7 @@ class LiveBridge:
                        sl_trigger=trigger, sl_limit=limit, sl_variety="STOPLOSS")
             self._save(pos)
             self._alert(f"STOP UNKNOWN for {contract['tradingsymbol']}; reconciling tagged stop before any further action")
-            return pos
+            return self._refresh_and_reconcile_stop(pos)
         except BrokerSafetyError as e:
             if intent_id:
                 try:
@@ -490,8 +719,8 @@ class LiveBridge:
             pos.update(error=f"SL placement rejected: {e}", status="STOP_UNKNOWN",
                        sl_trigger=trigger, sl_limit=limit, sl_variety="STOPLOSS")
             self._save(pos)
-            self._alert(f"STOP UNKNOWN for {contract['tradingsymbol']}: {e}; manual reconciliation required")
-            return pos
+            self._alert(f"STOP UNKNOWN for {contract['tradingsymbol']}: {e}; reconciling protection before continuing")
+            return self._refresh_and_reconcile_stop(pos)
         except Exception as e:
             # An unexpected exception after the claim may have happened after broker
             # acceptance. Mark UNKNOWN and never retry the placement blindly.
@@ -503,8 +732,8 @@ class LiveBridge:
             pos.update(error=f"SL submission uncertain: {type(e).__name__}: {e}", status="STOP_UNKNOWN",
                        sl_trigger=trigger, sl_limit=limit, sl_variety="STOPLOSS")
             self._save(pos)
-            self._alert(f"STOP UNKNOWN for {contract['tradingsymbol']}: unexpected submission error; manual reconciliation required")
-            return pos
+            self._alert(f"STOP UNKNOWN for {contract['tradingsymbol']}: unexpected submission error; reconciling protection")
+            return self._refresh_and_reconcile_stop(pos)
 
         pos.update(sl_order_id=oid, sl_trigger=trigger, sl_limit=limit,
                    sl_variety="STOPLOSS", error=None, status="STOP_UNKNOWN")
@@ -514,17 +743,12 @@ class LiveBridge:
         except Exception:
             log.exception("Could not link accepted STOP order to durable intent")
         info = self._poll(oid, {"trigger_pending", "open", "complete", "rejected", "cancelled"}, 4)
-        if info and info.get("status") in ("trigger_pending", "open") and int(info.get("filled") or 0) == 0:
-            pos.update(status="OPEN", sl_order_id=oid, sl_trigger=trigger, sl_limit=limit,
-                       sl_variety="STOPLOSS", sl_replace_count=0, error=None)
-            self._save(pos)
-            self._info(f"ENTERED {contract['tradingsymbol']} qty {pos['qty']} avg {pos.get('entry_avg')} | SL trigger {trigger} limit {limit}")
-            return pos
-        if info and info.get("status") == "complete":
+        if info and info.get("status") in TERMINAL:
             try:
-                om.update_intent(intent_id, "complete", broker_order_id=oid)
+                om.update_intent(intent_id, info["status"], broker_order_id=oid,
+                                 error=(info.get("text") or None))
             except Exception:
-                log.exception("Could not mark completed STOP intent")
+                log.exception("Could not update terminal STOP intent")
         elif info and int(info.get("filled") or 0) > 0:
             try:
                 om.update_intent(intent_id, "partial", broker_order_id=oid)
@@ -536,25 +760,23 @@ class LiveBridge:
                                  error=f"STOP order state not confirmed: {info}")
             except Exception:
                 log.exception("Could not mark unconfirmed STOP intent")
-        try:
-            book = {str(o.get("order_id")): o for o in self.broker.orders() if o.get("order_id")}
-            return self._reconcile_stop(pos, book)
-        except Exception as e:
-            pos.update(status="STOP_UNKNOWN", error=f"STOP accepted but order-book reconciliation failed: {e}")
-            self._save(pos)
-            self._alert(f"STOP UNKNOWN for {contract['tradingsymbol']}: broker state could not be reconciled")
-            return pos
+
+        # Do not mark the position OPEN merely because placeOrder returned an
+        # order id. Re-read the order and net position, then verify exact stop
+        # remaining quantity before declaring protection active.
+        result = self._refresh_and_reconcile_stop(pos)
+        if isinstance(result, dict) and result.get("status") == "OPEN":
+            self._info(f"ENTERED {contract['tradingsymbol']} qty {pos['qty']} avg {pos.get('entry_avg')} | SL trigger {result.get('sl_trigger')} limit {result.get('sl_limit')}")
+        return result
 
     def _reconcile_stop(self, pos, book):
         """Reconcile all tagged protective STOPs against actual broker net quantity."""
         rows = [o for o in book.values()
                 if o.get("tag") == pos.get("tag") and o.get("side") == "SELL"
-                and str(o.get("variety", "")).upper() == "STOPLOSS"]
+                and str(o.get("variety", "")).upper() == "STOPLOSS"
+                and self._order_matches_contract(o, pos["contract"])]
         if not rows:
-            pos.update(status="STOP_UNKNOWN", error="no tagged protective STOP found; manual reconciliation required")
-            self._save(pos)
-            self._alert(f"STOP UNKNOWN for {pos['signal_id']}: {pos['error']}")
-            return pos
+            return self._emergency_exit_if_unprotected(pos)
 
         active = [o for o in rows if o.get("status") in ("open", "trigger_pending", "unknown")]
         if len(active) > 1:
@@ -653,10 +875,33 @@ class LiveBridge:
                 self._save(pos)
                 self._alert(f"STOP UNKNOWN for {pos['signal_id']}: {pos['error']}")
                 return pos
+            stop_qty = int(o.get("quantity") or 0)
+            stop_filled = int(o.get("filled") or 0)
+            remaining = stop_qty - stop_filled
+            trigger = float(o.get("trigger") or 0)
+            limit_price = float(o.get("price") or 0)
+            order_type = str(o.get("order_type") or "").upper()
+            if (remaining != net_qty or trigger <= 0
+                    or order_type not in {"STOPLOSS_LIMIT", "STOPLOSS_MARKET", "STOP_LOSS_LIMIT", "STOP_LOSS_MARKET"}
+                    or (order_type in {"STOPLOSS_LIMIT", "STOP_LOSS_LIMIT"} and limit_price <= 0)):
+                pos.update(status="STOP_UNKNOWN", sl_order_id=o.get("order_id"),
+                           sl_variety="STOPLOSS",
+                           error=(f"Protective STOP integrity mismatch: remaining={remaining}, broker_net={net_qty}, "
+                                  f"type={order_type}, trigger={trigger}, limit={limit_price}"))
+                self._save(pos)
+                self._alert(f"STOP INTEGRITY FAILURE {pos['signal_id']}: cancelling protection and flattening verified quantity")
+                return self._exit_locked(pos, "STOP_INTEGRITY_FAILURE")
             pos.update(status="OPEN", sl_order_id=o.get("order_id"),
-                       sl_trigger=float(o.get("trigger") or pos.get("sl_trigger") or 0),
-                       sl_limit=float(o.get("price") or pos.get("sl_limit") or 0),
+                       sl_trigger=trigger,
+                       sl_limit=limit_price,
                        sl_variety="STOPLOSS", error=None)
+            desired_trigger = float(pos.get("desired_sl_trigger") or 0)
+            if desired_trigger > trigger + 1e-9:
+                self._save(pos)
+                self.sync_stop(pos["signal_id"], desired_trigger)
+                return self.store.get(pos["signal_id"]) or pos
+            pos.pop("desired_sl_trigger", None)
+            pos.pop("desired_sl_limit", None)
             self._save(pos)
             try:
                 if pos.get("sl_intent_id"):
@@ -667,10 +912,10 @@ class LiveBridge:
             self._info(f"Recovered existing stop {pos['sl_order_id']} for {pos['signal_id']}; no duplicate stop sent")
             return pos
 
-        pos.update(status="STOP_UNKNOWN", error="no active tagged protective stop found; manual reconciliation required")
-        self._save(pos)
-        self._alert(f"STOP UNKNOWN for {pos['signal_id']}: {pos['error']}")
-        return pos
+        # A terminal rejected/cancelled stop with no fills leaves the long
+        # option unprotected. After repeated broker snapshots prove there is no
+        # other active SELL on this exact contract, flatten the verified net qty.
+        return self._emergency_exit_if_unprotected(pos)
 
     # ══ TRAILING ═════════════════════════════════════════════════════════
     def sync_stop(self, signal_id: str, new_sl_price: float) -> bool:
@@ -694,29 +939,52 @@ class LiveBridge:
             new_limit = max(tick(new_trigger * (1 - self.cfg.sl_limit_buffer_pct / 100)), 0.05)
             if self.cfg.shadow:
                 return False
+
+            # Persist the desired ratchet before calling Angel One. If the
+            # response is lost, the supervisor can compare desired vs actual.
+            pos.update(desired_sl_trigger=new_trigger, desired_sl_limit=new_limit)
+            self._save(pos)
             ok = False
             for _ in range(2):
                 ok = self.broker.modify_order(pos["sl_order_id"], pos["contract"], variety=pos["sl_variety"],
                                               order_type="STOPLOSS_LIMIT", product=pos["product"],
-                                              quantity=pos["qty"], price=new_limit, trigger_price=new_trigger)
+                                              quantity=pos["qty"], price=new_limit, trigger_price=new_trigger,
+                                              tag=pos.get("tag", ""))
                 if ok:
                     break
                 self.sleep(0.5)
-            info = None
             try:
                 info = self.broker.get_order(pos["sl_order_id"])
             except BrokerSafetyError:
-                pass
-            if info and (info["status"] == "complete" or info["filled"] > 0):
+                info = None
+            if info and (info["status"] == "complete" or int(info.get("filled") or 0) > 0):
                 self._exit_locked(pos, "SL_FILLED")
                 return True
-            if not ok:
-                self._alert(f"SL MODIFY FAILED {signal_id}: old stop {pos['sl_trigger']} remains active", f"mod{signal_id}", 60)
-                return False
-            pos.update(sl_trigger=new_trigger, sl_limit=new_limit)
+
+            if info and info.get("status") in ("open", "trigger_pending"):
+                try:
+                    broker_net = int(self.broker.net_qty(pos["contract"]))
+                    remaining = int(info.get("quantity") or 0) - int(info.get("filled") or 0)
+                    actual_trigger = float(info.get("trigger") or 0)
+                    actual_limit = float(info.get("price") or 0)
+                except (BrokerSafetyError, TypeError, ValueError, OverflowError):
+                    broker_net, remaining, actual_trigger, actual_limit = -1, -1, 0.0, 0.0
+                if (broker_net == int(pos["qty"]) and remaining == broker_net
+                        and abs(actual_trigger - new_trigger) < 0.011
+                        and abs(actual_limit - new_limit) < 0.011):
+                    pos.update(sl_trigger=new_trigger, sl_limit=new_limit, error=None)
+                    pos.pop("desired_sl_trigger", None)
+                    pos.pop("desired_sl_limit", None)
+                    self._save(pos)
+                    self._info(f"SL raised {pos['contract']['tradingsymbol']} -> trigger {new_trigger}")
+                    return True
+
+            pos.update(status="STOP_UNKNOWN",
+                       error=(f"SL modification not confirmed: requested trigger={new_trigger}, limit={new_limit}; "
+                              f"broker_order={info}"))
             self._save(pos)
-            self._info(f"SL raised {pos['contract']['tradingsymbol']} -> trigger {new_trigger}")
-            return True
+            self._alert(f"SL MODIFY UNCONFIRMED {signal_id}: desired stop retained; supervisor will reconcile", f"mod{signal_id}", 60)
+            return False
 
     # ══ EXIT ═════════════════════════════════════════════════════════════
     def exit_position(self, signal_id: str, reason: str, hint_price: float = 0.0) -> bool:
@@ -724,7 +992,7 @@ class LiveBridge:
             return False
         with self._lock(signal_id):
             pos = self.store.get(signal_id)
-            if not pos or pos["status"] not in ("OPEN", "STOP_UNKNOWN", "EXITING", "EXIT_PENDING", "EXIT_BLOCKED", "UNKNOWN_ENTRY"):
+            if not pos or pos["status"] not in ("OPEN", "STOP_UNKNOWN", "EXITING", "EXIT_PENDING", "EXIT_BLOCKED", "UNKNOWN_ENTRY", "SUBMITTING"):
                 return False
             return self._exit_locked(pos, reason, hint_price)
 
@@ -987,8 +1255,11 @@ class LiveBridge:
         if not oid:
             return False
         info = self._safe_order(oid)
-        if info and info.get("status") in ("open", "trigger_pending", "unknown"):
-            self._pending(pos, f"Existing EXIT {oid} is still {info.get('status')}; preserving it and not submitting another SELL", "activeexit")
+        if info is None:
+            self._pending(pos, f"Existing EXIT {oid} cannot be confirmed from broker; refusing a duplicate SELL", "exitlookup")
+            return True
+        if info.get("status") not in TERMINAL:
+            self._pending(pos, f"Existing EXIT {oid} is {info.get('status')}; preserving it and not submitting another SELL", "activeexit")
             return True
         return False
 

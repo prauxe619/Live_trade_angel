@@ -3578,12 +3578,44 @@ class TargetMonitor:
             # monitor from tracking the signal and processing its eventual exit.
             if submit_live_entry and not sig.is_free_signal:
                 from trading_live.engine_hooks import submit_engine_entry
+
                 try:
-                    submit_engine_entry(sig, self.fetcher, TRADE_LOTS)
+                    live_result = submit_engine_entry(
+                        sig,
+                        self.fetcher,
+                        TRADE_LOTS,
+                    )
+
+                    if live_result is None:
+                        _log.error(
+                            "LIVE ENTRY NOT CONFIRMED signal=%s reason=NO_RESULT",
+                            sig.signal_id,
+                        )
+                    else:
+                        live_status = str(
+                            live_result.get("status", "UNKNOWN")
+                        ).upper()
+
+                        if live_status in {"SKIPPED", "REJECTED", "ENTRY_FAILED"}:
+                            _log.warning(
+                                "LIVE ENTRY NOT EXECUTED signal=%s status=%s reason=%s",
+                                sig.signal_id,
+                                live_status,
+                                live_result.get("reason", live_result.get("error", "")),
+                            )
+                        else:
+                            _log.info(
+                                "LIVE ENTRY BRIDGE ACCEPTED signal=%s status=%s",
+                                sig.signal_id,
+                                live_status,
+                            )
+
                 except Exception as exc:
                     _log.error(
-                        "LIVE ENTRY NOT CONFIRMED signal=%s; keeping signal under engine monitoring: %s",
-                        sig.signal_id, exc, exc_info=True,
+                        "LIVE ENTRY NOT CONFIRMED signal=%s reason=%s",
+                        sig.signal_id,
+                        exc,
+                        exc_info=True,
                     )
 
             with self._lock:
@@ -4222,6 +4254,19 @@ class DailySignalEngine:
                     persist_state=False,
                     submit_live_entry=False,
                 )
+                # On restart, reconcile the persisted engine SL with the
+                # broker-side stop immediately. A stop ratchet saved just
+                # before a crash must not remain only in engine memory.
+                try:
+                    from trading_live.engine_hooks import live_management_requested, sync_engine_stop
+                    if live_management_requested() and not sig.is_free_signal:
+                        sync_engine_stop(sig)
+                except Exception:
+                    _log.critical(
+                        "LIVE stop restoration sync failed for %s",
+                        sig.signal_id,
+                        exc_info=True,
+                    )
                 if r.get("signal_type") != "SWING":
                     prior = self._trade_open_time.get(idx_key)
                     self._trade_open_time[idx_key] = (
@@ -4260,6 +4305,16 @@ class DailySignalEngine:
                         is_free_signal= (r.get("channel") == "FREE"),
                     )
                     self.monitor.register(sig, submit_live_entry=False)
+                    try:
+                        from trading_live.engine_hooks import live_management_requested, sync_engine_stop
+                        if live_management_requested() and not sig.is_free_signal:
+                            sync_engine_stop(sig)
+                    except Exception:
+                        _log.critical(
+                            "LIVE stop restoration sync failed for %s",
+                            sig.signal_id,
+                            exc_info=True,
+                        )
                     if r.get("signal_type") != "SWING":
                         raw_created = r.get("created_at", r.get("timestamp"))
                         try:

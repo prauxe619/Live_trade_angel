@@ -34,51 +34,86 @@ def _bridge():
 
 
 def submit_engine_entry(sig, fetcher, trade_lots=1):
-    """Submit a new VIP signal using the engine's actual contract and quote age."""
+    """Submit a live entry with explicit, auditable skip/block reasons."""
 
-    if sig.is_free_signal or not live_execution_requested():
-        return None
+    sid = str(getattr(sig, "signal_id", "UNKNOWN"))
+    strategy = str(getattr(sig, "signal_type", "")).strip().upper()
 
-    allowed = {x.strip().upper() for x in os.getenv("LIVE_ALLOWED_TYPES", "JACKPOT,ZERO_HERO,LIVE_SNIPER").split(",") if x.strip()}
-    strategy = str(getattr(sig, "signal_type", "")).upper()
+    def skip(reason):
+        log.warning(
+            "LIVE ENTRY SKIPPED signal=%s index=%s strategy=%s reason=%s",
+            sid,
+            getattr(sig, "index_key", "UNKNOWN"),
+            strategy,
+            reason,
+        )
+        return {"status": "SKIPPED", "reason": reason, "signal_id": sid}
+
+    if getattr(sig, "is_free_signal", False):
+        return skip("FREE_SIGNAL")
+
+    if not live_execution_requested():
+        return skip(
+            "LIVE_EXECUTION_DISABLED: check TRADING_MODE and TRADING_ENABLED"
+        )
+
+    allowed = {
+        x.strip().upper()
+        for x in os.getenv(
+            "LIVE_ALLOWED_TYPES",
+            "JACKPOT,ZERO_HERO,LIVE_SNIPER"
+        ).split(",")
+        if x.strip()
+    }
+
     if strategy not in allowed:
-        log.info("LIVE ENTRY SKIP signal=%s: strategy %s is not allowlisted", sig.signal_id, strategy)
-        return None
+        return skip(f"STRATEGY_NOT_ALLOWLISTED:{strategy}")
 
-    quote = fetcher.get_option_quote(
-        sig.index_key,
-        int(sig.strike),
-        sig.direction,
-        sig.expiry,
-    )
-
-    if not quote or quote.get("entry_eligible") is not True:
-        reason = (quote or {}).get("reason", "quote unavailable")
+    try:
+        quote = fetcher.get_option_quote(
+            sig.index_key,
+            int(sig.strike),
+            sig.direction,
+            sig.expiry,
+        )
+    except Exception as exc:
         raise RuntimeError(
-            f"LIVE ENTRY BLOCKED: invalid or stale option quote: {reason}"
+            f"LIVE ENTRY BLOCKED: quote_fetch_error:{type(exc).__name__}:{exc}"
+        ) from exc
+
+    if not isinstance(quote, dict):
+        raise RuntimeError("LIVE ENTRY BLOCKED: quote_missing_or_invalid")
+
+    if quote.get("entry_eligible") is not True:
+        raise RuntimeError(
+            "LIVE ENTRY BLOCKED: quote_not_eligible:"
+            f"{quote.get('reason', 'unknown_reason')}"
         )
 
     snapshot_age = quote.get("snapshot_age_s")
 
     if snapshot_age is None:
-        raise RuntimeError("LIVE ENTRY BLOCKED: option quote age is missing")
+        raise RuntimeError("LIVE ENTRY BLOCKED: quote_age_missing")
 
-    snapshot_age = float(snapshot_age)
+    try:
+        snapshot_age = float(snapshot_age)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("LIVE ENTRY BLOCKED: quote_age_invalid") from exc
 
     if not math.isfinite(snapshot_age) or snapshot_age < -2:
         raise RuntimeError(
-            f"LIVE ENTRY BLOCKED: invalid quote age {snapshot_age}"
+            f"LIVE ENTRY BLOCKED: invalid_quote_age:{snapshot_age}"
         )
 
     payload = {
-        "signal_id": str(sig.signal_id),
+        "signal_id": sid,
         "index": str(sig.index_key),
         "direction": str(sig.direction),
         "strike": int(sig.strike),
         "expiry": str(sig.expiry),
         "entry_premium": float(sig.entry_premium),
         "sl_price": float(sig.sl_price),
-        "signal_type": str(sig.signal_type),
+        "signal_type": strategy,
         "lot_size": int(sig.lot_size),
         "quantity": int(sig.lot_size) * int(trade_lots),
         "trade_lots": int(trade_lots),
@@ -86,10 +121,12 @@ def submit_engine_entry(sig, fetcher, trade_lots=1):
     }
 
     log.info(
-        "LIVE ENTRY REQUEST signal=%s index=%s type=%s age=%.2fs",
-        sig.signal_id,
+        "LIVE ENTRY PREFLIGHT PASSED signal=%s index=%s "
+        "strategy=%s quantity=%s quote_age=%.2fs",
+        sid,
         sig.index_key,
-        sig.signal_type,
+        strategy,
+        payload["quantity"],
         snapshot_age,
     )
 
@@ -97,20 +134,29 @@ def submit_engine_entry(sig, fetcher, trade_lots=1):
 
     if result is None:
         raise RuntimeError(
-            f"LIVE ENTRY was not accepted by bridge: {sig.signal_id}"
+            f"LIVE ENTRY NOT ACCEPTED BY BRIDGE: {sid}"
         )
-    if str(result.get("status", "")).upper() in {"REJECTED", "ENTRY_FAILED"}:
+
+    status = str(result.get("status", "")).upper()
+
+    if status in {
+        "REJECTED",
+        "ENTRY_FAILED",
+        "DUPLICATE_BLOCKED",
+    }:
         raise RuntimeError(
-            f"LIVE ENTRY rejected by broker guard: {result.get('error') or result.get('status')}"
+            f"LIVE ENTRY REJECTED signal={sid}: "
+            f"{result.get('error') or status}"
         )
 
     log.info(
-        "LIVE ENTRY RESULT signal=%s status=%s",
-        sig.signal_id,
-        result.get("status"),
+        "LIVE ENTRY BRIDGE RESULT signal=%s status=%s",
+        sid,
+        status or "UNKNOWN",
     )
 
     return result
+
 
 
 def sync_engine_stop(sig):
@@ -124,7 +170,12 @@ def sync_engine_stop(sig):
     if not math.isfinite(stop_price) or stop_price <= 0:
         raise ValueError(f"Invalid engine stop price: {stop_price}")
 
-    result = _bridge().sync_stop(
+    bridge = _bridge()
+    if not bridge.has_live_position(str(sig.signal_id)):
+        log.info("LIVE STOP SYNC skipped for non-live signal=%s", sig.signal_id)
+        return True
+
+    result = bridge.sync_stop(
         str(sig.signal_id),
         stop_price,
     )
@@ -150,7 +201,15 @@ def submit_engine_exit(sig, reason, hint_price=0.0):
     if not math.isfinite(price) or price < 0:
         raise ValueError(f"Invalid exit hint price: {price}")
 
-    result = _bridge().exit_position(
+    bridge = _bridge()
+    if not bridge.has_live_position(str(sig.signal_id)):
+        # The signal may be paper-only, disallowed, shadowed, or rejected
+        # before any broker fill. Its engine lifecycle can close normally;
+        # never manufacture a SELL for a position that was not opened live.
+        log.info("LIVE EXIT skipped for non-live signal=%s reason=%s", sig.signal_id, reason)
+        return True
+
+    result = bridge.exit_position(
         str(sig.signal_id),
         str(reason),
         price,

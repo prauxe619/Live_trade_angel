@@ -64,7 +64,11 @@ _STATUS_MAP = {
     "complete": "complete", "completed": "complete", "executed": "complete",
     "rejected": "rejected", "cancelled": "cancelled", "canceled": "cancelled",
     "trigger pending": "trigger_pending",
-    "open": "open", "open pending": "open", "validation pending": "open",
+    # A partially executed order is still live until its unfilled remainder is
+    # cancelled/terminal. Treat it as active so recovery never protects only
+    # the partial fill while the BUY remainder can still execute.
+    "pending": "open", "partially executed": "open", "partially filled": "open",
+    "partial": "open", "open": "open", "open pending": "open", "validation pending": "open",
     "put order req received": "open", "modified": "open", "modify pending": "open",
     "modify validation pending": "open", "after market order req received": "open",
 }
@@ -242,12 +246,17 @@ class AngelOneBroker:
         return str(oid)
 
     def modify_order(self, order_id: str, contract: dict, *, variety: str, order_type: str, product: str,
-                     quantity: int, price: float, trigger_price: float = 0.0) -> bool:
+                     quantity: int, price: float, trigger_price: float = 0.0, tag: str = "") -> bool:
         _require_gates(True)
         params = {"variety": variety, "orderid": order_id, "ordertype": order_type, "producttype": product,
                   "duration": "DAY", "price": str(tick(price)), "quantity": str(int(quantity)),
                   "tradingsymbol": contract["tradingsymbol"], "symboltoken": contract["symboltoken"],
                   "exchange": contract["exchange"]}
+        # Angel One requires the same ordertag on modify requests as the tag
+        # used on the original order. Omitting it can cause a valid SL ratchet
+        # to be rejected by SmartAPI.
+        if tag:
+            params["ordertag"] = str(tag)[:20]
         if trigger_price:
             params["triggerprice"] = str(tick(trigger_price))
         try:
@@ -301,7 +310,7 @@ class AngelOneBroker:
         filled = _num(row.get("filledshares"), int, 0)
         return {
             "order_id": str(row.get("orderid", "")),
-            "status": norm_status(row.get("orderstatus", row.get("status"))),
+            "status": norm_status(row.get("orderstatus") or row.get("status")),
             "filled": filled,
             "quantity": quantity,
             "remaining": max(0, quantity - filled),
