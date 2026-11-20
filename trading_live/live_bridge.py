@@ -482,47 +482,47 @@ class LiveBridge:
                     raise BrokerSafetyError(f"Contract lot mismatch: engine={engine_lot}, master={lot}")
 
                 if qty <= 0 or qty % lot != 0:
-                    raise BrokerSafetyError(f"Invalid engine quantity={qty}, verified lot={lot}")
+                    raise BrokerSafetyError(
+                        f"Invalid engine quantity={qty}, verified lot={lot}"
+                    )
 
-                 # Fetch a new execution price from Angel One.
-                 quote = self.broker.ltp_quote(contract)
- 
-                 ltp = float(quote.get("ltp", 0))
-                 response_received = float(
-                     quote.get("received_at_epoch", 0)
-                 )
- 
-                 response_age = time.time() - response_received
- 
-                 if not math.isfinite(ltp) or ltp <= 0:
-                     raise BrokerSafetyError(
-                         "Invalid Angel One execution LTP"
-                     )
- 
-                 if (
-                     not math.isfinite(response_age)
-                     or response_age < -2
-                     or response_age > 2.0
-                 ):
-                     raise BrokerSafetyError(
-                         f"Angel One LTP response too old: "
-                         f"{response_age:.2f}s"
-                     )
- 
-                 log.info(
-                     "LIVE EXECUTION QUOTE: %s LTP=%.2f "
-                     "API_latency=%.3fs response_age=%.3fs",
-                     contract["tradingsymbol"],
-                     ltp,
-                     quote.get("request_latency_s", 0),
-                     response_age,
-                 )
+                # Fetch a new execution price from Angel One.
+                quote = self.broker.ltp_quote(contract)
 
+                ltp = float(quote.get("ltp", 0))
+                response_received = float(
+                    quote.get("received_at_epoch", 0)
+                )
+
+                response_age = time.time() - response_received
+
+                if not math.isfinite(ltp) or ltp <= 0:
+                    raise BrokerSafetyError(
+                        "Invalid Angel One execution LTP"
+                    )
+
+                if (
+                    not math.isfinite(response_age)
+                    or response_age < -2
+                    or response_age > 2.0
+                ):
+                    raise BrokerSafetyError(
+                        f"Angel One LTP response too old: "
+                        f"{response_age:.2f}s"
+                    )
+
+                log.info(
+                    "LIVE EXECUTION QUOTE: %s LTP=%.2f "
+                    "API_latency=%.3fs response_age=%.3fs",
+                    contract["tradingsymbol"],
+                    ltp,
+                    quote.get("request_latency_s", 0),
+                    response_age,
+                )
 
                 paper_entry = float(sig["entry_premium"])
                 if not math.isfinite(paper_entry) or paper_entry <= 0:
                     raise BrokerSafetyError("Invalid engine entry premium")
-
                 # The BUY is a marketable LIMIT above LTP. Validate the
                 # worst permitted fill (the actual limit), not just the quote,
                 # so both price deviation and planned risk remain bounded.
