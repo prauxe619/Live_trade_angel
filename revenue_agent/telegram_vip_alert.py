@@ -55,19 +55,17 @@ load_dotenv()
 
 # One bot and exactly two destinations, shared with daily_signal_engine_v11.py.
 _SIGNAL_BOT_TOKEN: str = os.getenv("SIGNAL_BOT_TOKEN", "").strip()
-_CHAT_ID: str = os.getenv("CHAT_ID", "").strip()
 _LIVE_BOT_CHANNEL_ID: str = os.getenv("LIVE_BOT_CHANNEL_ID", "").strip()
 
 def _telegram_destinations() -> tuple[str, ...]:
-    """Return the two configured destinations once each; never route elsewhere."""
-    return tuple(dict.fromkeys(
-        chat_id for chat_id in (_CHAT_ID, _LIVE_BOT_CHANNEL_ID) if chat_id
-    ))
+    """Return only the configured Telegram channel."""
+    return (_LIVE_BOT_CHANNEL_ID,) if _LIVE_BOT_CHANNEL_ID else ()
 
-# Compatibility aliases for older imports; routing always uses _telegram_destinations().
+# Compatibility aliases
 _VIP_BOT_TOKEN = _SIGNAL_BOT_TOKEN
 _VIP_CHANNEL_ID = _LIVE_BOT_CHANNEL_ID
 _FREE_CHANNEL_ID = ""
+
 
 # ── PASTE YOUR COSMOFEED LINKS HERE ──────────────────────────────────────────
 PAYMENT_LINKS = {
