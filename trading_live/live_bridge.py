@@ -487,7 +487,10 @@ class LiveBridge:
                     )
 
                 # Fetch a new execution price from Angel One.
-                quote = self.broker.ltp_quote(contract)
+                quote = self.broker.market_quote(
+                    contract,
+                    max_age_s=self.cfg.max_quote_age_s,
+                )
 
                 ltp = float(quote.get("ltp", 0))
                 response_received = float(
@@ -512,13 +515,14 @@ class LiveBridge:
                     )
 
                 log.info(
-                    "LIVE EXECUTION QUOTE: %s LTP=%.2f "
-                    "API_latency=%.3fs response_age=%.3fs",
-                    contract["tradingsymbol"],
-                    ltp,
-                    quote.get("request_latency_s", 0),
-                    response_age,
-                )
+                      "LIVE EXECUTION QUOTE: %s LTP=%.2f "
+                      "feed_age=%.3fs API_latency=%.3fs response_age=%.3fs",
+                      contract["tradingsymbol"],
+                      ltp,
+                      quote.get("feed_age_s", -1),
+                      quote.get("request_latency_s", 0),
+                      response_age,
+                  )
 
                 paper_entry = float(sig["entry_premium"])
                 if not math.isfinite(paper_entry) or paper_entry <= 0:
