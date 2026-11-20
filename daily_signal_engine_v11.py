@@ -143,12 +143,13 @@ def _first_valid_env(*names):
     return ""
 
 # Use the existing signal-engine bot and exactly the two configured destinations.
+# Single Telegram destination: channel only.
 SIGNAL_BOT_TOKEN = os.getenv("SIGNAL_BOT_TOKEN", "").strip()
-_CHAT_ID = os.getenv("CHAT_ID", "").strip()
-_LIVE_BOT_CHANNEL_ID = os.getenv("LIVE_BOT_CHANNEL_ID", "").strip()
-TELEGRAM_CHAT_IDS = tuple(dict.fromkeys(
-    chat_id for chat_id in (_CHAT_ID, _LIVE_BOT_CHANNEL_ID) if chat_id
-))
+TELEGRAM_CHAT_ID = os.getenv("LIVE_BOT_CHANNEL_ID", "").strip()
+TELEGRAM_CHAT_IDS = (TELEGRAM_CHAT_ID,) if TELEGRAM_CHAT_ID else ()
+
+TRADING_TELEGRAM_CHAT_ID = TELEGRAM_CHAT_ID
+VIP_CHANNEL_ID = TELEGRAM_CHAT_ID
 
 # Compatibility aliases: the legacy single-chat name now means the channel only.
 TRADING_TELEGRAM_CHAT_ID = _LIVE_BOT_CHANNEL_ID
@@ -398,10 +399,10 @@ def _to_vip(text: str):
     """Queue every engine trade/decision notification to both configured chats."""
     if not isinstance(text, str) or not text.strip():
         return
-    if not SIGNAL_BOT_TOKEN or len(TELEGRAM_CHAT_IDS) != 2:
+    if not SIGNAL_BOT_TOKEN or len(TELEGRAM_CHAT_IDS) != 1:
         _log.error(
-            "Trade alert blocked: SIGNAL_BOT_TOKEN and exactly two distinct "
-            "Telegram destinations are required (found %d).",
+            "Trade alert blocked: SIGNAL_BOT_TOKEN and exactly one "
+            "Telegram channel destination are required (found %d).",
             len(TELEGRAM_CHAT_IDS),
         )
         return
