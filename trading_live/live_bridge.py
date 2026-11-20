@@ -1446,14 +1446,33 @@ _BRIDGE = None
 _BRIDGE_LOCK = threading.Lock()
 
 
-def get_bridge() -> LiveBridge:
+def get_bridge(auth_provider=None) -> LiveBridge:
     global _BRIDGE
+
     with _BRIDGE_LOCK:
+
         if _BRIDGE is None:
             store = PgStore()
             b = LiveBridge(store=store)
+
+            if auth_provider is not None:
+                b.broker.set_auth_provider(auth_provider)
+
             if b.enabled:
                 b.broker.login()
                 b.start_supervisor()
+
             _BRIDGE = b
+
+        elif auth_provider is not None:
+            existing_provider = getattr(
+                _BRIDGE.broker, "_auth_provider", None
+            )
+
+            if existing_provider is not auth_provider:
+                raise RuntimeError(
+                    "LiveBridge already initialized with a different "
+                    "Angel One authentication provider"
+                )
+
         return _BRIDGE
