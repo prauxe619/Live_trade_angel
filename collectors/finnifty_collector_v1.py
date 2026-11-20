@@ -292,42 +292,54 @@ class FinNiftyCollector:
 
     # ── Authentication ─────────────────────────────────────────────────────
 
+    
     def connect(self) -> bool:
         for attempt in range(CONFIG["MAX_RETRIES"]):
             try:
-                logger.info(f"Connecting to Angel One (attempt {attempt+1})...")
-                try:
-                    token_script = Path(__file__).resolve().parents[1] / "scripts" / "auto_refresh_tokens.py"
-                    subprocess.run(
-                        [sys.executable, str(token_script), "--account", "C"],
-                        check=True, timeout=30, cwd=str(Path(__file__).resolve().parents[1])
-                    )
-                    logger.info("Tokens refreshed.")
-                except Exception as e:
-                    logger.warning(f"Token refresh failed: {e}. Attempting direct login.")
-
+                logger.info(
+                    f"Connecting to Angel One (attempt {attempt + 1})..."
+                )
+    
+                # One direct authentication attempt for FINNIFTY account C.
+                # Do not run auto_refresh_tokens.py before this login.
                 self.api = SmartConnect(api_key=env("ANGEL_API_KEY_C"))
-                totp     = pyotp.TOTP(env("ANGEL_TOTP_C")).now()
-                session  = self.api.generateSession(
+    
+                totp = pyotp.TOTP(env("ANGEL_TOTP_C")).now()
+                session = self.api.generateSession(
                     env("ANGEL_CLIENT_ID_C"),
                     env("ANGEL_PASSWORD_C"),
                     totp
                 )
+    
                 if session.get("status"):
                     self.jwt_token = (session.get("data") or {}).get("jwtToken")
                     self.feed_token = self.api.getfeedToken()
+    
+                    if not self.jwt_token or not self.feed_token:
+                        logger.error(
+                            "FINNIFTY authentication returned an incomplete session."
+                        )
+                        time.sleep(CONFIG["RETRY_DELAY"])
+                        continue
+    
                     logger.info("Angel One session secured.")
                     return True
-                else:
-                    logger.error(f"Session failed: {session.get('message')}")
-
-                time.sleep(CONFIG["RETRY_DELAY"])
-
+    
+                logger.error(
+                    f"Session failed: {session.get('message')}"
+                )
+    
             except Exception as e:
-                logger.error(f"Connection error attempt {attempt+1}: {e}")
+                logger.error(
+                    f"Connection error attempt {attempt + 1}: {e}"
+                )
+    
+            if attempt < CONFIG["MAX_RETRIES"] - 1:
                 time.sleep(CONFIG["RETRY_DELAY"])
-
-        send_telegram_message("🚨 FATAL: FinNifty Collector failed to connect after all retries.")
+    
+        send_telegram_message(
+            "🚨 FATAL: FinNifty Collector failed to connect after all retries."
+        )
         return False
 
     # ── Safe Data Accessor ─────────────────────────────────────────────────
