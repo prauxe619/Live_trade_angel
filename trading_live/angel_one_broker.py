@@ -95,31 +95,112 @@ class AngelOneBroker:
         self._lock = threading.RLock()
         self._last_call = 0.0
         self._login_at = 0.0
+        self._auth_provider = None
+
+    # ── shared authentication session ────────────────────────────────────
+    def set_auth_provider(self, provider):
+        """Use the signal fetcher's authenticated SmartConnect session."""
+        if provider is None or not callable(getattr(provider, "_ensure_auth", None)):
+            raise BrokerSafetyError("Invalid shared Angel One auth provider")
+
+        if not hasattr(provider, "smart") or not hasattr(provider, "_auth_time"):
+            raise BrokerSafetyError("Shared auth provider lacks session state")
+
+        with self._lock:
+            if self._auth_provider is not None and self._auth_provider is not provider:
+                raise BrokerSafetyError(
+                    "Broker is already bound to a different auth provider"
+                )
+            self._auth_provider = provider
+            self.smart = None
+            self._login_at = 0.0
+
+    def _sync_provider_session(self, force=False):
+        """Refresh through the provider when needed and share its current client."""
+        provider = self._auth_provider
+        if provider is None:
+            raise BrokerSafetyError("Shared auth provider is not configured")
+
+        try:
+            authenticated = provider._ensure_auth(force=force)
+        except Exception as exc:
+            raise BrokerSafetyError(
+                f"Shared Angel One authentication raised {type(exc).__name__}"
+            ) from exc
+
+        if not authenticated or provider.smart is None:
+            raise BrokerSafetyError(
+                "Shared Angel One authentication failed; broker operation blocked"
+            )
+
+        self.smart = provider.smart
+        self._login_at = provider._auth_time or time.time()
+        return self.smart
 
     # ── session ───────────────────────────────────────────────────────────
     def login(self):
-        required = ["ANGEL_API_KEY", "ANGEL_CLIENT_ID", "ANGEL_PASSWORD", "ANGEL_TOTP"]
-        missing = [k for k in required if not os.getenv(k)]
-        if missing:
-            raise BrokerSafetyError("Missing trading credentials: " + ", ".join(missing))
-        from SmartApi import SmartConnect
-        import pyotp
         with self._lock:
+
+            # Shared-session mode: never generate a second session.
+            if self._auth_provider is not None:
+                self._sync_provider_session()
+                return {
+                    "authenticated": True,
+                    "shared_session": True,
+                    "client_id": os.environ["ANGEL_CLIENT_ID"],
+                }
+
+            # Standalone mode retained for other broker users.
+            required = [
+                "ANGEL_API_KEY",
+                "ANGEL_CLIENT_ID",
+                "ANGEL_PASSWORD",
+                "ANGEL_TOTP",
+            ]
+
+            missing = [k for k in required if not os.getenv(k)]
+
+            if missing:
+                raise BrokerSafetyError(
+                    "Missing trading credentials: " + ", ".join(missing)
+                )
+
+            from SmartApi import SmartConnect
+            import pyotp
+
             smart = SmartConnect(api_key=os.environ["ANGEL_API_KEY"])
             totp = pyotp.TOTP(os.environ["ANGEL_TOTP"]).now()
-            resp = smart.generateSession(os.environ["ANGEL_CLIENT_ID"], os.environ["ANGEL_PASSWORD"], totp)
+
+            resp = smart.generateSession(
+                os.environ["ANGEL_CLIENT_ID"],
+                os.environ["ANGEL_PASSWORD"],
+                totp,
+            )
+
             if not resp or not resp.get("status") or not resp.get("data"):
-                raise BrokerSafetyError("Angel One login failed (check logs; secrets are never printed)")
+                raise BrokerSafetyError(
+                    "Angel One login failed (check logs; secrets are never printed)"
+                )
+
             self.smart = smart
             self._login_at = time.time()
-        return {"authenticated": True, "client_id": os.environ["ANGEL_CLIENT_ID"]}
+
+            return {
+                "authenticated": True,
+                "client_id": os.environ["ANGEL_CLIENT_ID"],
+            }
 
     def _call(self, name: str, *args, retry_on_token_error: bool = True, **kw):
         with self._lock:
-            if self.smart is None:
-                raise BrokerSafetyError("Call login() first")
-            if time.time() - self._login_at > self.RELOGIN_AFTER_S:
-                self.login()
+            if self._auth_provider is not None:
+                # Always synchronize in case the data fetcher refreshed its session.
+                self._sync_provider_session()
+            else:
+                if self.smart is None:
+                    raise BrokerSafetyError("Call login() first")
+
+                if time.time() - self._login_at > self.RELOGIN_AFTER_S:
+                    self.login()
             gap = self.MIN_INTERVAL_S - (time.time() - self._last_call)
             if gap > 0:
                 time.sleep(gap)
@@ -127,8 +208,17 @@ class AngelOneBroker:
             res = getattr(self.smart, name)(*args, **kw)
             if (isinstance(res, dict) and res.get("errorcode") in self.TOKEN_ERRORS
                     and retry_on_token_error):
-                log.warning("Token error on %s; re-login and retry once", name)
-                self.login()
+                log.warning("Token error on %s; refresh session and retry once", name)
+
+                if self._auth_provider is not None:
+                    self._sync_provider_session(force=True)
+                else:
+                    self.login()
+
+                gap = self.MIN_INTERVAL_S - (time.time() - self._last_call)
+                if gap > 0:
+                    time.sleep(gap)
+
                 self._last_call = time.time()
                 res = getattr(self.smart, name)(*args, **kw)
             return res
@@ -453,3 +543,4 @@ class AngelOneBroker:
         if isinstance(res, dict) and res.get("status") and res.get("data"):
             return _num(res["data"].get("availablecash"), float, 0.0)
         raise BrokerSafetyError("Could not read available funds")
+
