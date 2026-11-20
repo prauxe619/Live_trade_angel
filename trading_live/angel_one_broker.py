@@ -12,6 +12,8 @@ from __future__ import annotations
 import os, json, time, logging, threading, urllib.request
 from pathlib import Path
 from datetime import datetime
+import time
+import math
 
 log = logging.getLogger("black.broker")
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -634,11 +636,56 @@ class AngelOneBroker:
                 total += _num(row.get("netqty"), int, 0)
         return total
 
+    
+    def ltp_quote(self, contract: dict) -> dict:
+        """
+        Request option LTP directly from Angel One.
+    
+        received_at_epoch is the API response receipt time,
+        NOT the exchange tick timestamp.
+        """
+        requested_at = time.time()
+    
+        res = self._call(
+            "ltpData",
+            contract["exchange"],
+            contract["tradingsymbol"],
+            contract["symboltoken"],
+        )
+    
+        received_at = time.time()
+    
+        if not isinstance(res, dict) or res.get("status") is not True:
+            raise BrokerSafetyError(
+                f"Angel One LTP request failed: "
+                f"{res.get('message') if isinstance(res, dict) else 'invalid response'}"
+            )
+    
+        data = res.get("data")
+        if not isinstance(data, dict):
+            raise BrokerSafetyError("Angel One returned invalid LTP data")
+    
+        ltp = _num(data.get("ltp"), float, 0.0)
+    
+        if not math.isfinite(ltp) or ltp <= 0:
+            raise BrokerSafetyError("Angel One returned invalid option LTP")
+    
+        return {
+            "ltp": ltp,
+            "requested_at_epoch": requested_at,
+            "received_at_epoch": received_at,
+            "request_latency_s": received_at - requested_at,
+            "exchange_feed_time": data.get("exchFeedTime"),
+            "exchange_trade_time": data.get("exchTradeTime"),
+            "symbol": contract["tradingsymbol"],
+            "symboltoken": contract["symboltoken"],
+        }
+    
+    
     def ltp(self, contract: dict) -> float:
-        res = self._call("ltpData", contract["exchange"], contract["tradingsymbol"], contract["symboltoken"])
-        if isinstance(res, dict) and res.get("status") and res.get("data"):
-            return _num(res["data"].get("ltp"), float, 0.0)
-        return 0.0
+        """Backward-compatible LTP method."""
+        return float(self.ltp_quote(contract)["ltp"])
+
 
     def available_cash(self) -> float:
         res = self._call("rmsLimit")
