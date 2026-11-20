@@ -104,11 +104,14 @@ class LiveBridge:
     def _telegram(self, text: str):
         """Send every live-bridge alert to the two canonical Telegram destinations."""
         token = os.getenv("SIGNAL_BOT_TOKEN", "").strip()
-        raw_destinations = (os.getenv("CHAT_ID", "").strip(),
-                            os.getenv("LIVE_BOT_CHANNEL_ID", "").strip())
-        destinations = tuple(dict.fromkeys(chat for chat in raw_destinations if chat))
-        if not token or len(destinations) != 2:
-            log.error("Telegram routing disabled: SIGNAL_BOT_TOKEN and two distinct destinations are required")
+        channel_id = os.getenv("LIVE_BOT_CHANNEL_ID", "").strip()
+        destinations = (channel_id,) if channel_id else ()
+        
+        if not token or len(destinations) != 1:
+            log.error(
+                "Telegram routing disabled: SIGNAL_BOT_TOKEN and "
+                "LIVE_BOT_CHANNEL_ID are required"
+            )
             return
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         for chat_id in destinations:
