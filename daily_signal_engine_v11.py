@@ -1794,12 +1794,34 @@ class SignalDataFetcher:
                     raw.get("timestamp", raw.get("updated_at", raw.get("generated_at")))
                 )
 
-            timestamp_candidates = [ts for ts in (feed_ts, row_ts) if ts is not None]
-            if trade_ts is not None:
-                timestamp_candidates.append(trade_ts)
-            timestamp_ages = [now - ts for ts in timestamp_candidates]
-            ages = [a for a in (snapshot_age, *timestamp_ages) if a is not None]
-            age = max(ages) if ages else None
+                        
+            # Use the market-feed timestamp and database row timestamp
+            # to measure quote freshness. Last-trade time is tracked separately:
+            # an old last trade does not automatically mean the live order book is stale.
+            
+            feed_age = (now - feed_ts) if feed_ts is not None else None
+            row_age = (now - row_ts) if row_ts is not None else None
+            trade_age = (now - trade_ts) if trade_ts is not None else None
+            
+            freshness_ages = [
+                value for value in (snapshot_age, feed_age, row_age)
+                if value is not None
+            ]
+            
+            age = max(freshness_ages) if freshness_ages else None
+            
+            _log.debug(
+                "OPTION QUOTE AGE index=%s strike=%s type=%s "
+                "db_age=%s feed_age=%s trade_age=%s effective_age=%s",
+                index_key,
+                strike,
+                d,
+                round(snapshot_age, 2) if snapshot_age is not None else None,
+                round(feed_age, 2) if feed_age is not None else None,
+                round(trade_age, 2) if trade_age is not None else None,
+                round(age, 2) if age is not None else None,
+            )
+
 
             bid = number(matched.get("bid"))
             ask = number(matched.get("ask"))
