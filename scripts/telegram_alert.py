@@ -14,20 +14,23 @@ logger = logging.getLogger("telegram")
 load_dotenv()
 
 BOT_TOKEN = os.getenv("SIGNAL_BOT_TOKEN", "").strip()
-TELEGRAM_DESTINATIONS = tuple(dict.fromkeys(
-    chat for chat in (
-        os.getenv("CHAT_ID", "").strip(),
-        os.getenv("LIVE_BOT_CHANNEL_ID", "").strip(),
-    ) if chat
-))
-# Compatibility name for older imports; delivery still fans out to both IDs.
-CHAT_ID = TELEGRAM_DESTINATIONS[0] if TELEGRAM_DESTINATIONS else ""
+
+TELEGRAM_CHAT_ID = os.getenv("LIVE_BOT_CHANNEL_ID", "").strip()
+TELEGRAM_DESTINATIONS = (
+    (TELEGRAM_CHAT_ID,) if TELEGRAM_CHAT_ID else ()
+)
+
+# Backwards-compatible alias
+CHAT_ID = TELEGRAM_CHAT_ID
 
 
 def send_telegram(message: str):
     """Send the same alert to both canonical destinations; fail closed on bad config."""
-    if not BOT_TOKEN or len(TELEGRAM_DESTINATIONS) != 2:
-        logger.error("Telegram routing disabled: SIGNAL_BOT_TOKEN and two distinct destinations are required")
+    if not BOT_TOKEN or len(TELEGRAM_DESTINATIONS) != 1:
+        logger.error(
+            "Telegram routing disabled: SIGNAL_BOT_TOKEN and "
+            "LIVE_BOT_CHANNEL_ID are required"
+        )
         return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
