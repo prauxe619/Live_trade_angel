@@ -12,6 +12,7 @@ from __future__ import annotations
 import os, json, time, logging, threading, urllib.request
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import time
 import math
 
@@ -680,6 +681,117 @@ class AngelOneBroker:
             "symbol": contract["tradingsymbol"],
             "symboltoken": contract["symboltoken"],
         }
+     
+    def market_quote(self, contract: dict, max_age_s: float = 5.0) -> dict:
+        """
+        Fetch a fresh single-contract FULL quote from Angel One.
+
+        Freshness is based on exchange exchFeedTime, not API response time.
+        Missing or invalid timestamps fail closed.
+        """
+        requested_at = time.time()
+
+        exchange = str(contract.get("exchange") or "").upper()
+        token = str(contract.get("symboltoken") or "").strip()
+        symbol = str(contract.get("tradingsymbol") or "").strip()
+
+        if exchange not in ("NFO", "BFO") or not token or not symbol:
+            raise BrokerSafetyError("Invalid contract for FULL market quote")
+
+        try:
+            max_age_s = float(max_age_s)
+        except (TypeError, ValueError, OverflowError):
+            raise BrokerSafetyError("Invalid MAX_QUOTE_AGE_S")
+
+        if not math.isfinite(max_age_s) or max_age_s <= 0:
+            raise BrokerSafetyError("Invalid MAX_QUOTE_AGE_S")
+
+        res = self._call(
+            "getMarketData",
+            "FULL",
+            {exchange: [token]},
+        )
+
+        received_at = time.time()
+
+        if not isinstance(res, dict) or res.get("status") is not True:
+            raise BrokerSafetyError("Angel One FULL market quote failed")
+
+        data = res.get("data")
+        if not isinstance(data, dict):
+            raise BrokerSafetyError("Invalid Angel One FULL quote response")
+
+        fetched = data.get("fetched")
+        if not isinstance(fetched, list):
+            raise BrokerSafetyError("Angel One FULL quote missing fetched records")
+
+        matches = [
+            item for item in fetched
+            if isinstance(item, dict)
+            and str(item.get("symbolToken") or "").strip() == token
+            and str(item.get("tradingSymbol") or "").strip() == symbol
+        ]
+
+        if len(matches) != 1:
+            raise BrokerSafetyError(
+                "Angel One FULL quote token/symbol mismatch or duplicate"
+            )
+
+        item = matches[0]
+
+        ltp = _num(item.get("ltp", item.get("lastPrice")), float, 0.0)
+
+        if not math.isfinite(ltp) or ltp <= 0:
+            raise BrokerSafetyError("Invalid LTP in Angel One FULL quote")
+
+        raw_feed_time = item.get("exchFeedTime")
+
+        if not raw_feed_time:
+            raise BrokerSafetyError(
+                "Angel One FULL quote missing exchange feed timestamp"
+            )
+
+        try:
+            feed_dt = datetime.strptime(
+                str(raw_feed_time).strip(),
+                "%d-%b-%Y %H:%M:%S",
+            ).replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+
+            feed_epoch = feed_dt.timestamp()
+
+        except (TypeError, ValueError, OverflowError):
+            raise BrokerSafetyError(
+                f"Invalid exchange feed timestamp: {raw_feed_time!r}"
+            )
+
+        feed_age_s = received_at - feed_epoch
+
+        if (
+            not math.isfinite(feed_age_s)
+            or feed_age_s < -2.0
+            or feed_age_s > max_age_s
+        ):
+            raise BrokerSafetyError(
+                f"Stale/invalid exchange quote: "
+                f"feed_age={feed_age_s:.2f}s "
+                f"maximum={max_age_s:.2f}s"
+            )
+
+        return {
+            "ltp": ltp,
+            "bid": _num(item.get("bidPrice"), float, 0.0),
+            "ask": _num(item.get("askPrice"), float, 0.0),
+            "requested_at_epoch": requested_at,
+            "received_at_epoch": received_at,
+            "request_latency_s": received_at - requested_at,
+            "exchange_feed_time": raw_feed_time,
+            "exchange_trade_time": item.get("exchTradeTime"),
+            "feed_age_s": feed_age_s,
+            "symbol": symbol,
+            "symboltoken": token,
+            "exchange": exchange,
+        }
+
     
     
     def ltp(self, contract: dict) -> float:
