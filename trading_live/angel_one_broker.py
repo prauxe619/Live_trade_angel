@@ -543,4 +543,3 @@ class AngelOneBroker:
         if isinstance(res, dict) and res.get("status") and res.get("data"):
             return _num(res["data"].get("availablecash"), float, 0.0)
         raise BrokerSafetyError("Could not read available funds")
-
