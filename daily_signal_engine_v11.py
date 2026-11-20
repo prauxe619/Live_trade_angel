@@ -1076,9 +1076,15 @@ class SignalDataFetcher:
         self.smart = None
         return False
 
-    def _ensure_auth(self):
-        if self.smart is None or (time.time() - self._auth_time) > self._auth_ttl:
-            self._auth()
+    def _ensure_auth(self, force=False) -> bool:
+        if (
+            force
+            or self.smart is None
+            or (time.time() - self._auth_time) > self._auth_ttl
+        ):
+            return self._auth()
+
+        return True
 
     def _fetch_ltp_api(self, exchange: str, symbol: str, token: str) -> float:
         """API Fallback for fetching option LTP if JSON is stale/missing"""
@@ -4113,7 +4119,7 @@ class DailySignalEngine:
         if live_management_requested():
             try:
                 from trading_live.live_bridge import get_bridge
-                bridge = get_bridge()
+                bridge = get_bridge(auth_provider=self.fetcher)
                 _log.info(
                     "LIVE bridge bootstrapped at engine startup (shadow=%s, entry_enabled=%s)",
                     bridge.cfg.shadow, bridge.entry_enabled,
