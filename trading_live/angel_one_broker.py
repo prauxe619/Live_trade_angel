@@ -290,19 +290,77 @@ class AngelOneBroker:
             raise BrokerSafetyError("orderBook contains a malformed order row")
         return data
 
+    
     def position_book(self) -> list:
-        res = self._call("position")
-        if not isinstance(res, dict) or res.get("status") is not True:
-            raise BrokerSafetyError(f"position failed or status is not true: {res!r}")
-        data = res.get("data")
-        if not isinstance(data, list):
-            raise BrokerSafetyError(
-                f"position data is not a confirmed list (received {type(data).__name__}); "
-                "manual-position check unavailable"
-            )
-        if any(not isinstance(row, dict) for row in data):
-            raise BrokerSafetyError("position response contains a malformed row")
-        return data
+        """
+        Fetch and validate the account position book.
+        Never interpret an unavailable response as an empty position book.
+        """
+        last_response = None
+    
+        for attempt in range(2):
+            try:
+                res = self._call("position")
+                last_response = res
+    
+                if not isinstance(res, dict):
+                    raise BrokerSafetyError(
+                        f"position returned invalid response type: "
+                        f"{type(res).__name__}"
+                    )
+    
+                if res.get("status") is not True:
+                    raise BrokerSafetyError(
+                        "position API failed: "
+                        f"message={res.get('message')!r}, "
+                        f"errorcode={res.get('errorcode')!r}"
+                    )
+    
+                data = res.get("data")
+    
+                if isinstance(data, list):
+                    if any(not isinstance(row, dict) for row in data):
+                        raise BrokerSafetyError(
+                            "position response contains a malformed row"
+                        )
+                    return data
+    
+                if attempt == 0:
+                    log.warning(
+                        "Position API returned unexpected data type=%s; "
+                        "retrying once. message=%s errorcode=%s",
+                        type(data).__name__,
+                        res.get("message"),
+                        res.get("errorcode"),
+                    )
+                    time.sleep(0.6)
+                    continue
+    
+                raise BrokerSafetyError(
+                    "position data is not a confirmed list "
+                    f"(received {type(data).__name__}); "
+                    "manual-position check unavailable. "
+                    f"message={res.get('message')!r}, "
+                    f"errorcode={res.get('errorcode')!r}"
+                )
+    
+            except BrokerSafetyError:
+                if attempt == 1:
+                    raise
+                time.sleep(0.6)
+    
+            except Exception as exc:
+                if attempt == 1:
+                    raise BrokerSafetyError(
+                        f"Position API unavailable after retry: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
+                time.sleep(0.6)
+    
+        raise BrokerSafetyError(
+            f"Position API unavailable: {last_response!r}"
+        )
+
 
     @staticmethod
     def _normalise(row: dict) -> dict:
