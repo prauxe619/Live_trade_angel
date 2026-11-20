@@ -138,7 +138,7 @@ def submit_engine_entry(sig, fetcher, trade_lots=1):
 
     log.info(
         "LIVE ENTRY PREFLIGHT PASSED signal=%s index=%s "
-        "strategy=%s quantity=%s quote_age=%.2fs",
+        "strategy=%s quantity=%s strategy_snapshot_age=%.2fs",
         sid,
         sig.index_key,
         strategy,
