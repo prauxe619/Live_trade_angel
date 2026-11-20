@@ -53,7 +53,10 @@ class Ec2PipelineRegressionTests(unittest.TestCase):
             self.assertIn(exchange_type, source, path)
             self.assertIn("update_credentials(self.jwt_token, self.feed_token)", source, path)
         fin = self.read("collectors/finnifty_collector_v1.py")
-        self.assertIn('"--account", "C"', fin)
+        self.assertIn('env("ANGEL_API_KEY_C")', fin)
+        self.assertIn('env("ANGEL_TOTP_C")', fin)
+        self.assertIn('env("ANGEL_CLIENT_ID_C")', fin)
+        self.assertIn('env("ANGEL_PASSWORD_C")', fin)
 
     def test_engine_uses_separate_futures_volume(self):
         source = self.read("daily_signal_engine_v11.py")
