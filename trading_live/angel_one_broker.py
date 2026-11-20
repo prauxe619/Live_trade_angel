@@ -96,6 +96,10 @@ class AngelOneBroker:
         self._last_call = 0.0
         self._login_at = 0.0
         self._auth_provider = None
+    
+        # Order-book rate-limit protection
+        self._order_book_backoff_until = 0.0
+        self._order_book_failures = 0
 
     # ── shared authentication session ────────────────────────────────────
     def set_auth_provider(self, provider):
@@ -193,34 +197,79 @@ class AngelOneBroker:
     def _call(self, name: str, *args, retry_on_token_error: bool = True, **kw):
         with self._lock:
             if self._auth_provider is not None:
-                # Always synchronize in case the data fetcher refreshed its session.
                 self._sync_provider_session()
             else:
                 if self.smart is None:
                     raise BrokerSafetyError("Call login() first")
-
+    
                 if time.time() - self._login_at > self.RELOGIN_AFTER_S:
                     self.login()
-            gap = self.MIN_INTERVAL_S - (time.time() - self._last_call)
-            if gap > 0:
-                time.sleep(gap)
-            self._last_call = time.time()
-            res = getattr(self.smart, name)(*args, **kw)
-            if (isinstance(res, dict) and res.get("errorcode") in self.TOKEN_ERRORS
-                    and retry_on_token_error):
-                log.warning("Token error on %s; refresh session and retry once", name)
-
+    
+            def invoke():
+                gap = self.MIN_INTERVAL_S - (time.time() - self._last_call)
+    
+                if gap > 0:
+                    time.sleep(gap)
+    
+                self._last_call = time.time()
+    
+                try:
+                    return getattr(self.smart, name)(*args, **kw)
+    
+                except Exception as exc:
+                    error_text = str(exc).lower()
+    
+                    rate_limited = (
+                        "exceeding access rate" in error_text
+                        or "access denied" in error_text
+                        or "rate limit" in error_text
+                        or "too many requests" in error_text
+                    )
+    
+                    if rate_limited:
+                        log.error(
+                            "Angel One API rate limit: operation=%s",
+                            name
+                        )
+    
+                        if name == "placeOrder":
+                            raise OrderOutcomeUnknown(
+                                "Angel One rate-limit response during order "
+                                "submission; reconcile broker order book before "
+                                "any further order action"
+                            ) from exc
+    
+                        raise BrokerSafetyError(
+                            f"Angel One API rate limited operation: {name}"
+                        ) from exc
+    
+                    raise
+    
+            res = invoke()
+    
+            if (
+                isinstance(res, dict)
+                and res.get("errorcode") in self.TOKEN_ERRORS
+                and retry_on_token_error
+            ):
+                log.warning(
+                    "Token error on %s; refreshing session and retrying once",
+                    name
+                )
+    
                 if self._auth_provider is not None:
                     self._sync_provider_session(force=True)
                 else:
                     self.login()
-
-                gap = self.MIN_INTERVAL_S - (time.time() - self._last_call)
-                if gap > 0:
-                    time.sleep(gap)
-
-                self._last_call = time.time()
-                res = getattr(self.smart, name)(*args, **kw)
+    
+                # Never retry order submission.
+                if name == "placeOrder":
+                    raise OrderOutcomeUnknown(
+                        "Token error during order submission; reconciliation required"
+                    )
+    
+                res = invoke()
+    
             return res
 
     # ── instrument master ────────────────────────────────────────────────
@@ -367,18 +416,71 @@ class AngelOneBroker:
 
     # ── reads ────────────────────────────────────────────────────────────
     def order_book(self) -> list:
-        res = self._call("orderBook")
-        if not isinstance(res, dict) or res.get("status") is not True:
-            raise BrokerSafetyError(f"orderBook failed or status is not true: {res!r}")
-        data = res.get("data")
-        if not isinstance(data, list):
+        """
+        Fetch and validate broker order book.
+    
+        Never interpret a failed response as an empty order book.
+        Apply progressive backoff after API failures.
+        """
+    
+        now = time.time()
+    
+        # Avoid repeatedly hitting Angel One during rate limiting.
+        if now < self._order_book_backoff_until:
+            remaining = int(self._order_book_backoff_until - now) + 1
+    
             raise BrokerSafetyError(
-                f"orderBook data is not a confirmed list (received {type(data).__name__}); "
-                "manual-order check unavailable"
+                f"Order book temporarily unavailable; "
+                f"retry allowed in approximately {remaining} seconds"
             )
-        if any(not isinstance(row, dict) for row in data):
-            raise BrokerSafetyError("orderBook contains a malformed order row")
-        return data
+    
+        try:
+            res = self._call("orderBook")
+    
+            if not isinstance(res, dict) or res.get("status") is not True:
+                raise BrokerSafetyError(
+                    f"orderBook failed or status is not true: {res!r}"
+                )
+    
+            data = res.get("data")
+    
+            if not isinstance(data, list):
+                raise BrokerSafetyError(
+                    "orderBook data is not a confirmed list "
+                    f"(received {type(data).__name__}); "
+                    "manual-order check unavailable"
+                )
+    
+            if any(not isinstance(row, dict) for row in data):
+                raise BrokerSafetyError(
+                    "orderBook contains a malformed order row"
+                )
+    
+            # Successful response resets backoff.
+            self._order_book_failures = 0
+            self._order_book_backoff_until = 0.0
+    
+            return data
+    
+        except BrokerSafetyError as exc:
+            self._order_book_failures += 1
+    
+            # 30, 60, 120, 240, then maximum 300 seconds.
+            delay = min(
+                30 * (2 ** (self._order_book_failures - 1)),
+                300
+            )
+    
+            self._order_book_backoff_until = time.time() + delay
+    
+            log.error(
+                "Order book unavailable. Failure=%s Backoff=%ss Error=%s",
+                self._order_book_failures,
+                delay,
+                exc
+            )
+    
+            raise
 
     
     def position_book(self) -> list:
