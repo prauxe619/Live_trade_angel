@@ -264,6 +264,14 @@ header {
 .target-chip.hit { border-color:rgba(34,197,94,.45); color:var(--green); background:rgba(34,197,94,.07); }
 .target-chip.pending { color:var(--text2); }
 .moonbag-on { color:var(--purple); font-weight:700; }
+.target-chip.planned { border-style:dashed; }
+.target-chip.miss { border-color:rgba(239,68,68,.35); color:var(--red); background:rgba(239,68,68,.05); }
+.target-chip.unknown { border-style:dotted; color:var(--text2); }
+.dv-tag { font-size:8px; color:var(--gold); border:1px solid rgba(245,158,11,.35); border-radius:2px; padding:0 3px; margin-left:4px; cursor:help; vertical-align:middle; }
+.detail-section { font-size:8.5px; font-weight:700; letter-spacing:.16em; text-transform:uppercase; color:var(--text2); margin:10px 0 5px; }
+.detail-note { font-size:9px; color:var(--text2); margin-top:8px; line-height:1.5; }
+.rbar { position:relative; height:6px; background:var(--bg3); border-radius:3px; margin:6px 0 2px; overflow:hidden; }
+.rbar i { position:absolute; top:0; bottom:0; }
 .trade-detail-grid { display:flex; flex-wrap:wrap; gap:14px 22px; color:var(--text1); font-size:10px; }
 .trade-detail-grid b { color:var(--text0); font-weight:600; }
 .detail-toggle { border:1px solid var(--border2); background:var(--bg3); color:var(--accent2); padding:3px 7px; cursor:pointer; font:inherit; font-size:9px; border-radius:2px; }
@@ -731,7 +739,7 @@ const FP = v => v > 0 ? Number(v).toLocaleString('en-IN', {maximumFractionDigits
 const FI = v => {
   const n = Number(v);
   if (isNaN(n) || n === 0) return '—';
-  return (n >= 0 ? '+' : '') + '₹' + Math.abs(n).toLocaleString('en-IN', {maximumFractionDigits:0});
+  return (n < 0 ? '-' : '+') + '₹' + Math.abs(n).toLocaleString('en-IN', {maximumFractionDigits:0});
 };
 const FPts = v => {
   const n = Number(v);
@@ -803,7 +811,7 @@ let allSignals = [];
 
 function switchTab(tab) {
   currentTab = tab;
-  const tabs = ['all','open','vip','free','sniper','jackpot','hero','swing'];
+  const tabs = ['all','open','vip','breakout','sniper','jackpot','hero','swing'];
   document.querySelectorAll('.tab-btn').forEach((btn, i) => {
     btn.classList.toggle('active', tabs[i] === tab);
   });
@@ -963,32 +971,76 @@ function escapeHTML(value) {
 function renderTradeDetails(s) {
   const targets = Array.isArray(s.targets) ? s.targets : [];
   const progress = s.target_progress || {};
+  const derived = new Set(Array.isArray(s.derived) ? s.derived : []);
+  const dv = (field, note) => derived.has(field)
+    ? `<span class="dv-tag" title="${escapeHTML(note)}">derived</span>` : '';
   const moonbag = Boolean(s.moonbag || progress.moonbag);
   const peak = Number(s.peak || progress.peak || 0);
   const sl = Number(s.sl_price || progress.sl_price || 0);
   const tp = Number(s.tp_price || progress.tp_price || 0);
+  const entry = Number(s.entry_price || s.entry || 0);
   const exit = Number(s.exit_price || s.exit || progress.exit_price || 0);
+  const qty = Number(s.quantity || 0);
+  const isClosed = (s.status || '').toLowerCase() === 'closed';
 
   const targetHTML = targets.length ? targets.map((t, i) => {
-    const name = t.name || t.label || t.target_name || t.target || `Target ${i+1}`;
+    const name = t.name || t.label || t.target_name || `Target ${i+1}`;
     const price = Number(t.price || t.target_price || 0);
+    const known = t.hit_known !== false;
     const hit = Boolean(t.hit);
-    return `<span class="target-chip ${hit ? 'hit' : 'pending'}">
-      ${hit ? '✓' : '○'} ${escapeHTML(name)} ${price > 0 ? '₹'+price.toFixed(1) : ''}
-      — ${hit ? 'HIT' : 'PENDING'}
+    let cls = 'pending', mark = '○', word = 'PENDING';
+    if (!known)                          { cls = 'unknown'; mark = '?'; word = 'NOT RECORDED'; }
+    else if (hit)                        { cls = 'hit';     mark = '✓'; word = 'HIT'; }
+    else if (isClosed)                   { cls = 'miss';    mark = '✗'; word = 'NOT REACHED'; }
+    if (t.planned) cls += ' planned';
+    const pts = (entry > 0 && price > 0) ? ` (+${(price-entry).toFixed(1)})` : '';
+    return `<span class="target-chip ${cls}" title="${t.planned ? 'Planned target from signal SL/TP — no target ladder was stored for this trade' : ''}">
+      ${mark} ${escapeHTML(name)} ${price > 0 ? '₹'+price.toFixed(1)+pts : ''} — ${word}${t.hit_time ? ' @ '+escapeHTML(String(t.hit_time).slice(11,16)) : ''}
     </span>`;
-  }).join('') : '<span class="target-chip pending">Target-state data not available</span>';
+  }).join('') : '<span class="target-chip unknown">No target data for this trade</span>';
 
-  return `<div class="target-strip">${targetHTML}</div>
+  // entry → SL / exit / target position bar
+  let bar = '';
+  const lo = Math.min(...[sl, exit, entry].filter(v => v > 0));
+  const hi = Math.max(...[tp, peak, exit, entry].filter(v => v > 0));
+  if (entry > 0 && hi > lo) {
+    const pos = v => ((v - lo) / (hi - lo) * 100).toFixed(1);
+    const mk = (v, col, w=2) => v > 0 ? `<i style="left:${pos(v)}%;width:${w}px;background:${col}"></i>` : '';
+    bar = `<div class="rbar">${mk(sl,'var(--red)')}${mk(entry,'var(--text1)')}${mk(tp,'var(--green)')}${mk(peak,'var(--purple)')}${mk(exit, exit>=entry?'var(--green)':'var(--red)',4)}</div>
+      <div style="display:flex;justify-content:space-between;font-size:8px;color:var(--text2)"><span>SL ${sl>0?'₹'+sl.toFixed(1):'—'}</span><span>Entry ₹${entry.toFixed(1)}</span><span>Target ${tp>0?'₹'+tp.toFixed(1):'—'}</span></div>`;
+  }
+
+  const r = s.r_multiple, roi = s.roi_pct, hold = s.hold_minutes, mfe = s.mfe_pts;
+  const rCls = r > 0 ? 'pnl-pos' : r < 0 ? 'pnl-neg' : '';
+  const holdTxt = hold == null ? '—' : hold >= 60 ? (hold/60).toFixed(1)+' h' : Math.round(hold)+' min';
+  const src = Array.isArray(s.sources) ? s.sources.join(' + ') : (s.source || '—');
+
+  return `<div class="detail-section">Target ladder</div>
+    <div class="target-strip">${targetHTML}</div>
+    ${bar}
+    <div class="detail-section">Trade management</div>
     <div class="trade-detail-grid">
       <span>Moonbag: <b class="${moonbag ? 'moonbag-on' : ''}">${moonbag ? 'YES' : 'NO'}</b></span>
-      <span>Peak stored: <b>${peak > 0 ? '₹'+peak.toFixed(1) : '—'}</b></span>
-      <span>Current/final SL: <b>${sl > 0 ? '₹'+sl.toFixed(1) : '—'}</b></span>
-      <span>Final target: <b>${tp > 0 ? '₹'+tp.toFixed(1) : '—'}</b></span>
+      <span>Peak premium: <b>${peak > 0 ? '₹'+peak.toFixed(1) : 'not stored'}</b></span>
+      <span>Max favourable: <b>${mfe != null ? (mfe>=0?'+':'')+mfe.toFixed(1)+' pts' : '—'}</b></span>
+      <span>Stop loss: <b>${sl > 0 ? '₹'+sl.toFixed(1) : '—'}</b>${dv('sl_price','Not stored by the engine — worked out from the signal SL points, or from the exit price on an SL exit')}</span>
+      <span>Final target: <b>${tp > 0 ? '₹'+tp.toFixed(1) : '—'}</b>${dv('tp_price','Worked out as entry + signal target points')}</span>
       <span>Exit: <b>${exit > 0 ? '₹'+exit.toFixed(1) : '—'}</b></span>
       <span>Exit reason: <b>${escapeHTML(s.outcome || progress.outcome || '—')}</b></span>
-      <span>Quantity: <b>${Number(s.quantity || 0) || '—'}</b></span>
-    </div>`;
+      <span>Quantity: <b>${qty || '—'}</b>${dv('quantity','Not stored — worked out as ₹ P&L ÷ points P&L (or lots × lot size)')}</span>
+    </div>
+    <div class="detail-section">Trade quality</div>
+    <div class="trade-detail-grid">
+      <span>R-multiple: <b class="${rCls}">${r != null ? (r>=0?'+':'')+r.toFixed(2)+'R' : '—'}</b></span>
+      <span>Premium ROI: <b class="${rCls}">${roi != null ? (roi>=0?'+':'')+roi.toFixed(1)+'%' : '—'}</b></span>
+      <span>Risk taken: <b>${s.risk_pts ? s.risk_pts.toFixed(1)+' pts' : '—'}</b></span>
+      <span>Time in trade: <b>${holdTxt}</b></span>
+      <span>Conviction: <b>${s.prob ? (Math.abs(s.prob)*100).toFixed(0)+'%' : '—'}</b></span>
+      <span>Regime: <b>${escapeHTML(s.regime || '—')}</b></span>
+      <span>Trigger: <b>${escapeHTML(s.trigger || '—')}</b></span>
+      <span>Spot at entry: <b>${s.spot > 0 ? FP(s.spot) : '—'}</b></span>
+    </div>
+    <div class="detail-note">Data from: ${escapeHTML(src)} · ${s.state_found ? 'engine state found' : 'no engine state row for this trade'}${derived.size ? ' · <span style="color:var(--gold)">“derived” = calculated here, not recorded by the engine</span>' : ''}</div>`;
 }
 
 function toggleTradeDetails(index) {

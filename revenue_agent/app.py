@@ -6,7 +6,7 @@ import os
 import sqlite3
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, request, redirect, session, url_for
@@ -276,6 +276,14 @@ SNAPSHOTS = {
     "SENSEX": ROOT_DIR / "data" / "live" / "sensex_live_snapshot.json",
 }
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _now_ist():
+    """Market time. Servers (Railway etc.) usually run in UTC, so never trust datetime.now()."""
+    return datetime.now(IST)
+
+
 INDICES = {
     "NIFTY": {"label": "Nifty 50", "emoji": "🔵", "lot": 65},
     "BANKNIFTY": {"label": "Bank Nifty", "emoji": "🟠", "lot": 30},
@@ -448,7 +456,7 @@ def _read_snapshot(index_key):
 
 def _is_market():
     from datetime import time as dt_time
-    now = datetime.now()
+    now = _now_ist()
     return now.weekday() < 5 and dt_time(9, 15) <= now.time() <= dt_time(15, 30)
 
 
@@ -634,13 +642,14 @@ def _get_postgres_signal_states(days=3650):
         return {}
 
 
-def _get_postgres_paper_trades(days=3650):
+def _get_postgres_paper_trades(days=3650, signal_states=None):
     """Read daily_signal_engine_v11 paper trades from PostgreSQL."""
     try:
         from trading_live.shared_store import _connect
 
         since = datetime.now() - timedelta(days=days)
-        signal_states = _get_postgres_signal_states(days=days)
+        if signal_states is None:
+            signal_states = _get_postgres_signal_states(days=days)
 
         with _connect() as conn:
             with conn.cursor() as cur:
@@ -723,39 +732,214 @@ def _get_postgres_paper_trades(days=3650):
         return []
 
 
+# ── Target-ladder parsing / trade-detail enrichment ───────────────────────────
+
+_T_NAME = ("name", "label", "target_name", "id", "key")
+_T_PRICE = ("price", "target_price", "level", "value", "tp", "px")
+_T_HIT = ("hit", "is_hit", "reached", "achieved", "done", "triggered")
+
+
+def _is_empty(v):
+    return v is None or v == "" or v == 0 or v == [] or v == {}
+
+
+def _norm_target(t, i, peak=0.0):
+    """Normalise one target entry from any shape the engine may have persisted."""
+    if isinstance(t, dict):
+        name = next((str(t[k]) for k in _T_NAME if t.get(k) not in (None, "")), None)
+        if name is None and isinstance(t.get("target"), str):
+            name = t["target"]
+        name = name or f"T{i + 1}"
+        price = next((_safe_float(t[k]) for k in _T_PRICE if t.get(k) not in (None, "")), 0.0)
+        hit, known = False, False
+        for k in _T_HIT:
+            if k in t and t[k] is not None:
+                hit, known = bool(t[k]), True
+                break
+        if not known and str(t.get("status", "")).lower() in {"hit", "done", "reached", "achieved"}:
+            hit, known = True, True
+        return {"name": name, "price": price, "hit": hit, "hit_known": known,
+                "hit_time": str(t.get("hit_time") or t.get("hit_at") or "")}
+    if isinstance(t, (int, float)) and not isinstance(t, bool):
+        price = float(t)
+        known = peak > 0 and price > 0
+        return {"name": f"T{i + 1}", "price": price, "hit": bool(known and peak >= price),
+                "hit_known": known, "hit_time": "", "inferred_from_peak": known}
+    return {"name": f"T{i + 1}", "price": 0.0, "hit": False, "hit_known": False, "hit_time": ""}
+
+
+def _extract_targets(src, peak=0.0):
+    """Targets as a list, a name->value dict, or flat keys (t1_price / target1 / tp1 ...)."""
+    if not isinstance(src, dict):
+        return []
+    raw = src.get("targets")
+    if isinstance(raw, list) and raw:
+        return [_norm_target(t, i, peak) for i, t in enumerate(raw)]
+    if isinstance(raw, dict) and raw:
+        out = []
+        for i, (k, v) in enumerate(raw.items()):
+            if isinstance(v, dict):
+                v = {"name": k, **v}
+            elif isinstance(v, bool):
+                v = {"name": k, "hit": v}
+            else:
+                v = {"name": k, "price": v}
+            out.append(_norm_target(v, i, peak))
+        return out
+    out = []
+    for i in range(1, 7):
+        for pk in (f"t{i}_price", f"t{i}", f"target{i}", f"target_{i}", f"tp{i}"):
+            if src.get(pk) not in (None, "") and not isinstance(src.get(pk), bool):
+                hit = src.get(f"t{i}_hit", src.get(f"target{i}_hit", src.get(f"tp{i}_hit")))
+                out.append(_norm_target({"name": f"T{i}", "price": src[pk], "hit": hit}, i - 1, peak))
+                break
+    return out
+
+
+def _enrich_signal(s, state):
+    """
+    Fill the gaps the dashboard shows as '—': targets, SL, final target, quantity, peak, moonbag.
+    Persisted engine state always wins. Anything we have to work out ourselves is listed in
+    s['derived'] so the UI can label it honestly instead of passing it off as recorded data.
+    """
+    state = state if isinstance(state, dict) else {}
+    raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+    meta = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    derived = []
+
+    entry = _safe_float(s.get("entry"))
+    exit_px = _safe_float(s.get("exit"))
+    closed = _is_closed(s)
+    outcome = str(s.get("outcome") or state.get("outcome") or "").upper()
+    idx = str(s.get("index") or "").upper()
+
+    # 1) persisted state, then paper_trades.metadata
+    for k in ("sl_price", "tp_price", "peak", "trail_trigger"):
+        for src in (state, meta):
+            v = _safe_float(src.get(k))
+            if v > 0 and _safe_float(s.get(k)) <= 0:
+                s[k] = v
+    for k in ("sl_pts", "tp_pts"):
+        v = _safe_float(meta.get(k)) or _safe_float(state.get(k))
+        if v > 0 and _safe_float(s.get(k)) <= 0:
+            s[k] = v
+    if state.get("moonbag") or meta.get("moonbag"):
+        s["moonbag"] = True
+    if not s.get("outcome") and state.get("outcome"):
+        s["outcome"] = str(state["outcome"])
+
+    # 2) target ladder
+    peak = _safe_float(s.get("peak"))
+    targets = _extract_targets({"targets": s.get("targets")}, peak) if s.get("targets") else []
+    if not targets:
+        targets = _extract_targets(state, peak) or _extract_targets(meta, peak) or _extract_targets(raw, peak)
+
+    # 3) quantity
+    if _safe_int(s.get("quantity")) <= 0:
+        pi, pp = s.get("pnl_inr"), s.get("pnl_pts")
+        lot_sz = INDICES.get(idx, {}).get("lot", 0)
+        lots = _safe_int(s.get("lot"))
+        if pi not in (None, 0) and pp not in (None, 0):
+            q = int(round(abs(_safe_float(pi) / _safe_float(pp))))
+            if q > 0:
+                s["quantity"] = q
+                derived.append("quantity")
+        if _safe_int(s.get("quantity")) <= 0 and 0 < lots <= 50 and lot_sz:
+            s["quantity"] = lots * lot_sz
+            derived.append("quantity")
+
+    # 4) SL / final target
+    if _safe_float(s.get("sl_price")) <= 0:
+        if entry > 0 and _safe_float(s.get("sl_pts")) > 0:
+            s["sl_price"] = round(entry - _safe_float(s["sl_pts"]), 2)
+            derived.append("sl_price")
+        elif closed and "SL" in outcome and exit_px > 0:
+            s["sl_price"] = exit_px
+            derived.append("sl_price")
+    if _safe_float(s.get("tp_price")) <= 0 and entry > 0 and _safe_float(s.get("tp_pts")) > 0:
+        s["tp_price"] = round(entry + _safe_float(s["tp_pts"]), 2)
+        derived.append("tp_price")
+
+    # 5) no ladder recorded -> show the planned final target, clearly flagged as planned
+    if not targets and _safe_float(s.get("tp_price")) > 0:
+        targets = [{"name": "Final target", "price": _safe_float(s["tp_price"]),
+                    "hit": "TARGET" in outcome, "hit_known": closed, "hit_time": "", "planned": True}]
+        derived.append("targets")
+    s["targets"] = targets
+
+    # 6) risk metrics (computed, never stored)
+    risk_pts = _safe_float(s.get("sl_pts"))
+    if risk_pts <= 0 and entry > 0 and _safe_float(s.get("sl_price")) > 0 and "sl_price" not in derived:
+        risk_pts = entry - _safe_float(s["sl_price"])
+    pp = s.get("pnl_pts")
+    s["risk_pts"] = round(risk_pts, 2) if risk_pts > 0 else None
+    s["r_multiple"] = round(_safe_float(pp) / risk_pts, 2) if (closed and pp is not None and risk_pts > 0) else None
+    s["roi_pct"] = round(_safe_float(pp) / entry * 100, 2) if (closed and pp is not None and entry > 0) else None
+    s["mfe_pts"] = round(_safe_float(s.get("peak")) - entry, 2) if (_safe_float(s.get("peak")) > 0 and entry > 0) else None
+    t0, t1 = _parse_dt(s.get("timestamp")), _parse_dt(s.get("exit_time"))
+    mins = (t1 - t0).total_seconds() / 60 if (t0 and t1) else None
+    s["hold_minutes"] = round(mins, 1) if (mins is not None and 0 <= mins <= 60 * 24 * 7) else None
+
+    s["derived"] = derived
+    s["state_found"] = bool(state)
+    s["target_progress"] = {
+        "moonbag": bool(s.get("moonbag")),
+        "peak": s.get("peak") or None,
+        "sl_price": s.get("sl_price") or None,
+        "tp_price": s.get("tp_price") or None,
+        "targets": targets,
+        "outcome": s.get("outcome", ""),
+        "exit_price": exit_px or None,
+        "exit_time": s.get("exit_time", ""),
+    }
+    return s
+
+
+def _merge_records(win, lose):
+    """Keep the higher-priority record but fill its blanks from the lower-priority copy of the same trade."""
+    out = dict(win)
+    for k, v in lose.items():
+        if k in ("source", "raw", "sources"):
+            continue
+        if _is_empty(out.get(k)) and not _is_empty(v):
+            out[k] = v
+    out["sources"] = sorted(set((win.get("sources") or [win.get("source")]) + (lose.get("sources") or [lose.get("source")])))
+    return out
+
+
 def _get_all_signals():
+    states = _get_postgres_signal_states(days=3650)
     sources = [
-        _get_postgres_paper_trades(days=3650),
+        _get_postgres_paper_trades(days=3650, signal_states=states),
         _read_signals_log(days=3650),
         _get_db_trades(days=3650),
         _black_db_trade_candidates(),
     ]
-    merged = {}
-    source_priority = {
-        "postgres_paper": 4,
-        "signal_engine": 3,
-        "paper_trader": 2,
-        "black_db": 1,
-    }
+    source_priority = {"postgres_paper": 4, "signal_engine": 3, "paper_trader": 2, "black_db": 1}
 
+    groups = defaultdict(list)
     for source_rows in sources:
         for s in source_rows:
-            key = _dedup_key(s)
-            old = merged.get(key)
-            if old is None or source_priority.get(s.get("source"), 0) > source_priority.get(old.get("source"), 0):
-                merged[key] = s
+            groups[_dedup_key(s)].append(s)
 
-    signals = list(merged.values())
+    signals = []
+    for rows in groups.values():
+        rows.sort(key=lambda r: source_priority.get(r.get("source"), 0), reverse=True)
+        merged = rows[0]
+        merged["sources"] = [merged.get("source")]
+        for other in rows[1:]:
+            merged = _merge_records(merged, other)
+        signals.append(merged)
 
     # Today's state signal is a display fallback only; it is never treated as a closed trade.
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _now_ist().strftime("%Y-%m-%d")
     if not any(s.get("date") == today for s in signals):
         state = _read_state()
         best = state.get("best_signal")
         if isinstance(best, dict) and best.get("index"):
             signals.insert(0, _normalize_signal({
                 "signal_id": f"state_{best.get('index')}_{today}",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "timestamp": _now_ist().strftime("%Y-%m-%d %H:%M"),
                 "date": today,
                 "index": best.get("index", ""),
                 "label": INDICES.get(best.get("index", ""), {}).get("label", ""),
@@ -771,6 +955,10 @@ def _get_all_signals():
                 "status": "today_best",
                 "trigger": "SNIPER",
             }, "state_fallback"))
+
+    for s in signals:
+        _enrich_signal(s, states.get(str(s.get("signal_id") or s.get("id") or ""), {}))
+        s.pop("raw", None)  # keeps /api payloads small and always JSON-serialisable
 
     signals.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
     return signals
@@ -794,7 +982,7 @@ def _max_drawdown(rows):
     running = 0.0
     peak = 0.0
     max_dd = 0.0
-    for s in reversed(sorted(rows, key=lambda x: str(x.get("timestamp", "")))):
+    for s in sorted(rows, key=lambda x: str(x.get("timestamp", ""))):
         running += _pnl_inr(s)
         peak = max(peak, running)
         max_dd = min(max_dd, running - peak)
@@ -827,7 +1015,7 @@ def _bucket_stats(rows, key_func):
 
 def _compute_target_analytics(signals):
     """Count persisted target hits and moonbag trades without inferring missing data."""
-    closed_or_open = [s for s in signals if s.get("targets") or s.get("target_progress")]
+    closed_or_open = [s for s in signals if any(not t.get("planned") for t in (s.get("targets") or []))]
     target_counts = defaultdict(lambda: {"hit": 0, "not_hit": 0, "known": 0})
     moonbag_count = 0
     moonbag_open = 0
@@ -843,7 +1031,7 @@ def _compute_target_analytics(signals):
         if not isinstance(targets, list):
             continue
         for target in targets:
-            if not isinstance(target, dict):
+            if not isinstance(target, dict) or target.get("planned") or target.get("hit_known") is False:
                 continue
             name = str(target.get("name") or target.get("label") or target.get("target") or "Unnamed")
             bucket = target_counts[name]
@@ -866,7 +1054,7 @@ def _compute_stats(signals):
     closed = _closed(signals)
     wins = [s for s in closed if _pnl_inr(s) > 0]
     losses = [s for s in closed if _pnl_inr(s) < 0]
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _now_ist().strftime("%Y-%m-%d")
     today_closed = [s for s in closed if s.get("date") == today]
     net = sum(_pnl_inr(s) for s in closed)
 
@@ -1293,6 +1481,16 @@ def api_trade_ledger():
             "status": s.get("status"),
             "exit_time": s.get("exit_time"),
             "source": s.get("source"),
+            "quantity": s.get("quantity"),
+            "sl_price": s.get("sl_price"),
+            "tp_price": s.get("tp_price"),
+            "peak": s.get("peak"),
+            "moonbag": s.get("moonbag"),
+            "targets": s.get("targets"),
+            "r_multiple": s.get("r_multiple"),
+            "roi_pct": s.get("roi_pct"),
+            "hold_minutes": s.get("hold_minutes"),
+            "derived": s.get("derived"),
         })
 
     return jsonify({"total": len(signals), "offset": offset, "limit": limit or len(signals), "trades": ledger})

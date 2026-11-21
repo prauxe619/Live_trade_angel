@@ -182,6 +182,13 @@ INDICES = {
     "FINNIFTY" : {"token": "26037",  "exchange": "NSE", "label": "Fin Nifty",  "emoji": "💜", "strike_gap": 50,  "lot": 60, "min_prob": 0.62},
     "SENSEX"   : {"token": "999901", "exchange": "BSE", "label": "Sensex",     "emoji": "🔴", "strike_gap": 100, "lot": 20, "min_prob": 0.68},
 }
+
+MOONBAG_PREMIUM_SL_STEP = {
+    "BANKNIFTY": 60.0,
+    "SENSEX": 70.0,
+    "NIFTY": 25.0,
+    "FINNIFTY": 30.0,
+}
 VIX_TOKEN = "26017"
 
 # ── Per-index option premium SL/TP floors (in ₹ premium points) ───────────────
@@ -3507,6 +3514,7 @@ class ActiveSignal:
         self.moonbag_atr = None
         self.moonbag_swing_low = None
         self.moonbag_last_candle_ts = None
+        self.moonbag_last_sl_trigger_premium = float(entry_premium)
         self._moonbag_last_refresh = 0.0
         self._moonbag_last_peak_persist = 0.0
         self._moonbag_warmup_logged = False
@@ -3790,6 +3798,8 @@ class TargetMonitor:
             if is_final:
                 sig.moonbag = True
                 sig.peak = max(sig.peak, curr)
+                # Start measuring premium movement from the final-target hit.
+                sig.moonbag_last_sl_trigger_premium = float(sig.peak)
 
                 # Final Target: move SL to Target 2.5.
                 # Never lower an already higher stop.
@@ -3859,36 +3869,105 @@ class TargetMonitor:
             return
 
         # MOONBAG: peak updates on every valid quote; ATR/swing refresh only periodically.
+                # MOONBAG: Track OPTION PREMIUM movement.
+        # ATR/swing SL recalculation happens only after the configured
+        # premium increase for the relevant index.
         if sig.moonbag:
             prior_peak = float(sig.peak)
             sig.peak = max(prior_peak, curr)
+
             now_mono = time.monotonic()
-            if (sig.peak > prior_peak
-                    and now_mono - float(getattr(sig, "_moonbag_last_peak_persist", 0.0)) >= 30.0
-                    and SIGNAL_STATE_PG_ENABLED and not sig.is_free_signal):
+
+            # Persist new premium peak periodically.
+            if (
+                sig.peak > prior_peak
+                and now_mono - float(
+                    getattr(sig, "_moonbag_last_peak_persist", 0.0)
+                ) >= 30.0
+                and SIGNAL_STATE_PG_ENABLED
+                and not sig.is_free_signal
+            ):
                 from trading_live.signal_state import save_signal_state
                 save_signal_state(sig)
                 sig._moonbag_last_peak_persist = now_mono
-            candle_changed = False
-            if now_mono - float(getattr(sig, "_moonbag_last_refresh", 0.0)) >= 5.0:
+
+            # Get the premium movement threshold for this index.
+            step = float(
+                MOONBAG_PREMIUM_SL_STEP.get(sig.index_key, 0.0)
+            )
+
+            last_trigger = float(
+                getattr(
+                    sig,
+                    "moonbag_last_sl_trigger_premium",
+                    sig.peak,
+                )
+            )
+
+            premium_movement = sig.peak - last_trigger
+
+            # Only recalculate ATR/swing SL after the premium threshold.
+            # The five-second guard prevents repeated calculations.
+            if (
+                step > 0
+                and premium_movement >= step
+                and now_mono - float(
+                    getattr(sig, "_moonbag_last_refresh", 0.0)
+                ) >= 5.0
+            ):
                 sig._moonbag_last_refresh = now_mono
-                atr, swing_low, candle_ts = self._load_moonbag_atr_swing(sig)
-                if candle_ts and candle_ts != sig.moonbag_last_candle_ts:
-                    candle_changed = True
-                    sig.moonbag_last_candle_ts = candle_ts
-                sl_changed = False
-                if atr is not None:
+
+                atr, swing_low, candle_ts = (
+                    self._load_moonbag_atr_swing(sig)
+                )
+
+                try:
+                    atr_value = float(atr)
+                except (TypeError, ValueError, OverflowError):
+                    atr_value = 0.0
+
+                # Do not consume the premium threshold if ATR is unavailable.
+                if math.isfinite(atr_value) and atr_value > 0:
+                    old_sl = float(sig.sl_price)
+
                     sl_changed = sig.ratchet_sl(
-                        curr, atr=atr, swing_low=swing_low
+                        sig.peak,
+                        atr=atr_value,
+                        swing_low=swing_low,
                     )
 
-                if sl_changed and not sig.is_free_signal:
-                    from trading_live.engine_hooks import sync_engine_stop
-                    sync_engine_stop(sig)
-                if (SIGNAL_STATE_PG_ENABLED and not sig.is_free_signal
-                        and (candle_changed or sl_changed)):
-                    from trading_live.signal_state import save_signal_state
-                    save_signal_state(sig)
+                    # One ratchet per threshold crossing.
+                    # The next trigger is measured from this new peak.
+                    sig.moonbag_last_sl_trigger_premium = float(
+                        sig.peak
+                    )
+
+                    if candle_ts:
+                        sig.moonbag_last_candle_ts = candle_ts
+
+                    if sl_changed and not sig.is_free_signal:
+                        from trading_live.engine_hooks import sync_engine_stop
+                        sync_engine_stop(sig)
+
+                    if (
+                        SIGNAL_STATE_PG_ENABLED
+                        and not sig.is_free_signal
+                    ):
+                        from trading_live.signal_state import save_signal_state
+                        save_signal_state(sig)
+
+                    if sl_changed:
+                        _log.info(
+                            "MOONBAG PREMIUM SL RATCHET | %s | "
+                            "peak=₹%.1f | movement=₹%.1f | "
+                            "step=₹%.1f | SL ₹%.1f -> ₹%.1f",
+                            sig.signal_id,
+                            sig.peak,
+                            premium_movement,
+                            step,
+                            old_sl,
+                            sig.sl_price,
+                        )
 
             # Alert only after SL advances by at least 10% of the target distance.
             if (not sig.is_free_signal and
@@ -4444,6 +4523,12 @@ class DailySignalEngine:
         )
         sig.moonbag = bool(r.get("moonbag", final_target_hit))
         sig.peak = float(r.get("peak", max(sig.tp_price, sig.entry_premium) if sig.moonbag else sig.entry_premium))
+        sig.moonbag_last_sl_trigger_premium = float(
+            r.get(
+                "moonbag_last_sl_trigger_premium",
+                sig.peak,
+            )
+        )
         sig._last_sl_alert = sig.sl_price
         sig.moonbag_atr = r.get("moonbag_atr")
         sig.moonbag_swing_low = r.get("moonbag_swing_low")

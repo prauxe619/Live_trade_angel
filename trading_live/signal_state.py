@@ -80,6 +80,14 @@ def signal_to_payload(sig: Any) -> dict:
         ],
                 "moonbag": bool(getattr(sig, "moonbag", False)),
                 "peak": float(getattr(sig, "peak", getattr(sig, "entry_premium", 0.0))),
+                "moonbag_last_sl_trigger_premium": _finite_positive(
+                    getattr(
+                        sig,
+                        "moonbag_last_sl_trigger_premium",
+                        getattr(sig, "peak", sig.entry_premium),
+                    ),
+                    "moonbag_last_sl_trigger_premium",
+                ),
 
                 "moonbag_atr": (
                     None
