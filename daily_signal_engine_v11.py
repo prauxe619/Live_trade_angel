@@ -223,175 +223,6 @@ STRONG_BK_RETEST_MAX_AGE_SEC = 900
 STRONG_BK_CONFIRM_BODY_RATIO = 0.45
 STRONG_BK_MIN_ATR_PCT = 0.0005
 
-
-
-# ZERO-TO-HERO ADAPTIVE TARGET SETTINGS
-ZERO_HERO_MIN_ROI = 0.40       # Minimum target: +40% ROI
-ZERO_HERO_MAX_ROI = 1.50      # Maximum target: +150% ROI
-ZERO_HERO_ATR_MULTIPLIER = 7.5
-
-def calculate_zero_hero_target(
-    index_key: str,
-    expiry: str,
-    strike: int,
-    direction: str,
-    entry_premium: float,
-):
-    """
-    Adaptive Zero-to-Hero target using option-premium candles.
-
-    Requires at least 15 completed candles.
-    Returns None if valid candle data is unavailable.
-    """
-
-    from collectors.scripts import market_store
-
-    try:
-        entry = float(entry_premium)
-
-        if not math.isfinite(entry) or entry <= 0:
-            return None
-
-        rows = market_store.load_option_ohlcv_candles(
-            index_key,
-            expiry,
-            strike,
-            direction,
-            limit=80,
-        )
-
-        if not rows or len(rows) < 15:
-            _log.warning(
-                "[ZERO_HERO] Insufficient option candles: %s | rows=%s",
-                index_key,
-                len(rows) if rows else 0,
-            )
-            return None
-
-        # The loader must return completed candles in chronological order.
-        highs = [float(row["high"]) for row in rows]
-        lows = [float(row["low"]) for row in rows]
-        closes = [float(row["close"]) for row in rows]
-
-        if not all(
-            math.isfinite(x) and x > 0
-            for x in highs + lows + closes
-        ):
-            return None
-
-        # ATR(14), using the latest 14 true-range observations.
-        true_ranges = []
-
-        for i in range(1, len(rows)):
-            tr = max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes[i - 1]),
-                abs(lows[i] - closes[i - 1]),
-            )
-            true_ranges.append(tr)
-
-        atr = sum(true_ranges[-14:]) / 14.0
-
-        if not math.isfinite(atr) or atr <= 0:
-            return None
-
-        # Premium momentum across the latest four completed candles.
-        momentum = closes[-1] - closes[-4]
-        momentum_atr = momentum / atr
-
-        if momentum_atr >= 1.0:
-            momentum_label = "STRONG"
-            momentum_factor = 1.15
-
-        elif momentum_atr >= 0.35:
-            momentum_label = "MODERATE"
-            momentum_factor = 1.0
-
-        else:
-            momentum_label = "WEAK"
-            momentum_factor = 0.85
-
-        # Time remaining until the intraday force-close at 15:25 IST.
-        now = _ist_now()
-
-        minutes_left = (
-            15 * 60 + 25
-            - (now.hour * 60 + now.minute)
-        )
-
-        if minutes_left <= 0:
-            return None
-
-        if minutes_left > 120:
-            time_factor = 1.0
-
-        elif minutes_left > 60:
-            time_factor = 0.90
-
-        elif minutes_left > 30:
-            time_factor = 0.75
-
-        else:
-            time_factor = 0.60
-
-        # Volatility-adjusted premium movement.
-        raw_target_move = (
-            atr
-            * ZERO_HERO_ATR_MULTIPLIER
-            * momentum_factor
-            * time_factor
-        )
-
-        # Preserve the proposed 40%-150% ROI boundaries.
-        minimum_move = entry * ZERO_HERO_MIN_ROI
-        maximum_move = entry * ZERO_HERO_MAX_ROI
-
-        target_move = max(
-            minimum_move,
-            min(raw_target_move, maximum_move),
-        )
-
-        target_price = round(entry + target_move, 1)
-        target_move = round(target_price - entry, 1)
-
-        target_roi = round(
-            (target_move / entry) * 100,
-            1,
-        )
-
-        result = {
-            "target_distance": target_move,
-            "target_price": target_price,
-            "target_roi": target_roi,
-            "atr": round(atr, 2),
-            "momentum": momentum_label,
-            "momentum_atr": round(momentum_atr, 2),
-            "minutes_left": minutes_left,
-        }
-
-        _log.info(
-            "[ZERO_HERO ADAPTIVE TARGET] %s | "
-            "Entry=%.1f ATR=%.2f Momentum=%s "
-            "TimeLeft=%d Target=%.1f ROI=%.1f%%",
-            index_key,
-            entry,
-            atr,
-            momentum_label,
-            minutes_left,
-            target_price,
-            target_roi,
-        )
-
-        return result
-
-    except Exception as exc:
-        _log.exception(
-            "[ZERO_HERO] Dynamic target calculation failed: %s",
-            exc,
-        )
-        return None
-
-
 def _vix_sl_multiplier(vix: float) -> float:
     """Return SL/TP scaling factor based on India VIX."""
     if vix >= 28: return 1.80
@@ -3579,27 +3410,12 @@ class Fmt:
             + _pay_block()
         )
 
-    
     @staticmethod
-    def vip_zero_hero(
-        cfg: dict,
-        strike: int,
-        direction: str,
-        expiry: str,
-        entry_premium: float,
-        target_price: float,
-        target_roi: float,
-        atr: float,
-        momentum: str,
-    ) -> str:
-
-        de = "📈" if direction == "CE" else "📉"
-
-        sl_price = max(
-            round(entry_premium * 0.4, 1),
-            1,
-        )
-
+    def vip_zero_hero(cfg: dict, strike: int, direction: str, expiry: str,
+                      entry_premium: float) -> str:
+        de       = "📈" if direction == "CE" else "📉"
+        tp_price = round(entry_premium * 2.5, 1)
+        sl_price = max(round(entry_premium * 0.4, 1), 1)
         return (
             f"🚀 <b>ZERO-TO-HERO (0DTE) — {cfg['label']}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -3607,16 +3423,12 @@ class Fmt:
             f"{de} <b>{strike} {direction} | Expiry TODAY</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📥 <b>Entry Premium : ₹{entry_premium:.1f}</b>\n"
-            f"🛑 <b>Stop Loss : ₹{sl_price:.1f}</b>\n"
-            f"🎯 <b>Adaptive Target : ₹{target_price:.1f}</b>\n"
-            f"💰 <b>Target ROI : +{target_roi:.1f}%</b>\n"
-            f"📊 <b>Option ATR : ₹{atr:.2f}</b>\n"
-            f"📈 <b>Premium Momentum : {momentum}</b>\n"
+            f"🛑 <b>Stop Loss : ₹{sl_price}</b> (Strict!)\n"
+            f"🎯 <b>Target : ₹{tp_price}+</b> (150%+ ROI)\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️ <i>0DTE Risk: Use small capital.</i>\n"
             f"🕒 <i>{_now()}</i>"
         )
-
 
     @staticmethod
     def free_zero_hero_alert(cfg: dict, direction: str) -> str:
@@ -3627,7 +3439,7 @@ class Fmt:
             f"Retailers are getting trapped in the chop. 🪤\n"
             f"BLACK just detected massive Operator volume on <b>{cfg['label']}</b> for a 0DTE {de} setup.\n\n"
             f"⚡ <b>Algorithm Probability: 92% (High Conviction)</b>\n"
-            f"💸 <b>Adaptive target calculated from premium momentum and volatility.</b>\n\n"
+            f"💸 <b>Aiming for 150%+ ROI before market close.</b>\n\n"
             f"🔒 <i>VIP members have already received the exact strike and entry price.</i>\n\n"
             f"Are you going to miss the biggest expiry move of the day? 👇\n"
             + _pay_block()
@@ -5335,96 +5147,14 @@ class DailySignalEngine:
                                 hero_premium,
                             )
                             continue
-
-                        # Hero always uses its original baseline contract.
-                        sniper["strike"] = base_strike
+                    
                         trade_expiry = hero_expiry
                         entry_prem = float(hero_premium)
-
-                        # Calculate adaptive Zero-to-Hero target.
-                        hero_target = calculate_zero_hero_target(
-                            index_key=idx_key,
-                            expiry=trade_expiry,
-                            strike=sniper["strike"],
-                            direction=sniper["direction"],
-                            entry_premium=entry_prem,
-                        )
-
-                        # Fail closed if completed option candles are unavailable.
-                        # Never silently fall back to the fixed 150% target.
-                        if not hero_target:
-                            _log.warning(
-                                "[ZERO_HERO %s] BLOCKED: adaptive target unavailable. "
-                                "Completed option candles required.",
-                                idx_key,
-                            )
-                            continue
-
-                        # Validate adaptive target output.
-                        required_fields = (
-                            "target_distance",
-                            "target_price",
-                            "target_roi",
-                            "atr",
-                            "momentum",
-                        )
-
-                        if any(
-                            field not in hero_target
-                            or not math.isfinite(float(hero_target[field]))
-                            for field in required_fields
-                        ):
-                            _log.warning(
-                                "[ZERO_HERO %s] BLOCKED: invalid adaptive target output | %r",
-                                idx_key,
-                                hero_target,
-                            )
-                            continue
-
-                        # Enforce maximum 200% ROI independently.
-                        max_target_distance = entry_prem * 2.00
-
-                        sniper["tp_pts"] = round(
-                            min(float(hero_target["target_distance"]), max_target_distance),
-                            1,
-                        )
-
-                        # Recalculate absolute target price after applying the cap.
-                        hero_target["target_distance"] = sniper["tp_pts"]
-                        hero_target["target_price"] = round(
-                            entry_prem + sniper["tp_pts"],
-                            1,
-                        )
-                        hero_target["target_roi"] = round(
-                            sniper["tp_pts"] / entry_prem,
-                            4,
-                        )
-                        # PRESERVE ORIGINAL STOP LOSS.
-                        sniper["sl_pts"] = max(
-                            round(entry_prem * 0.4, 1),
-                            1,
-                        )
-                        # Preserve existing trailing trigger calculation.
-                        sniper["trail_pts"] = round(
-                            sniper["tp_pts"] * 0.5,
-                            1,
-                        )
-
-                        # Send the actual calculated target to VIP.
-                        _to_vip(
-                            Fmt.vip_zero_hero(
-                                cfg,
-                                sniper["strike"],
-                                sniper["direction"],
-                                trade_expiry,
-                                entry_prem,
-                                hero_target["target_price"],
-                                hero_target["target_roi"],
-                                hero_target["atr"],
-                                hero_target["momentum"],
-                            )
-                        )
-
+                        _to_vip(Fmt.vip_zero_hero(cfg, sniper["strike"], sniper["direction"],
+                                                   trade_expiry, entry_prem))
+                        sniper["tp_pts"]    = round(entry_prem * 1.5, 1)
+                        sniper["sl_pts"]    = max(round(entry_prem * 0.4, 1), 1)
+                        sniper["trail_pts"] = round(sniper["tp_pts"] * 0.5, 1)
                         sniper_type = "ZERO_HERO"
                         is_free_sig = False
                     elif is_jackpot:
