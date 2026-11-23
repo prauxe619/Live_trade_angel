@@ -13,6 +13,23 @@ from typing import Any
 from .shared_store import _connect, init_schema
 
 
+def list_unresolved_intents():
+    """
+    Return every intent that is not in a terminal state.
+
+    Required returned fields:
+        intent_id
+        signal_id
+        action
+        status
+        broker_order_id
+        payload
+
+    Must not modify any intent.
+    Must raise on database/query failure.
+    """
+    ...
+
 def stable_intent_id(signal_id: str, action: str) -> str:
     if not signal_id:
         raise ValueError("signal_id required")
