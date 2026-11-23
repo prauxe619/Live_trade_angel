@@ -15,6 +15,9 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import time
 import math
+import os
+import threading
+import time
 
 log = logging.getLogger("black.broker")
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -101,6 +104,17 @@ class AngelOneBroker:
         self._auth_provider = None
     
         # Order-book rate-limit protection
+        # Order-book request manager.
+        # One cache and lock per broker session.
+        self._order_book_lock = threading.RLock()
+        
+        self._order_book_cache = None
+        self._order_book_cache_at = 0.0
+        
+        self._order_book_cache_ttl = max(
+            0.5,
+            float(os.getenv("ORDER_BOOK_CACHE_TTL_SECONDS", "2"))
+        )
         self._order_book_backoff_until = 0.0
         self._order_book_failures = 0
 
@@ -365,125 +379,321 @@ class AngelOneBroker:
         return payload
 
     # ── orders ───────────────────────────────────────────────────────────
+    
     def place_order(self, payload: dict, reduce_only: bool = False) -> str:
+        """
+        Submit one order to Angel One.
+    
+        Safety rules:
+        - Order submission must pass the existing trading gates.
+        - reduce_only is allowed only for SELL orders (long options).
+        - Never automatically retry an order submission.
+        - Explicit broker rejection raises BrokerSafetyError.
+        - Ambiguous responses raise OrderOutcomeUnknown.
+        """
+    
+        # Validate payload before attempting broker submission.
+        if not isinstance(payload, dict):
+            raise BrokerSafetyError("Order payload must be a dictionary")
+    
+        transaction_type = str(
+            payload.get("transactiontype") or ""
+        ).strip().upper()
+    
+        if transaction_type not in {"BUY", "SELL"}:
+            raise BrokerSafetyError(
+                f"Invalid transactiontype in order payload: {transaction_type!r}"
+            )
+    
+        if reduce_only and transaction_type != "SELL":
+            raise BrokerSafetyError(
+                "reduce_only orders must be SELL (long options only)"
+            )
+    
+        # Keep the existing execution gates.
+        # This must remain outside the broker-call exception handler.
         _require_gates(reduce_only)
-        if reduce_only and payload.get("transactiontype") != "SELL":
-            raise BrokerSafetyError("reduce_only orders must be SELL (long options only)")
+    
+        # Select the broker API method supported by this SDK instance.
+        fn = (
+            "placeOrderFullResponse"
+            if hasattr(self.smart, "placeOrderFullResponse")
+            else "placeOrder"
+        )
+    
         try:
-            fn = "placeOrderFullResponse" if hasattr(self.smart, "placeOrderFullResponse") else "placeOrder"
-            res = self._call(fn, payload, retry_on_token_error=False)
+            # IMPORTANT:
+            # Do not retry order submissions automatically.
+            # A timeout or connection failure can happen after broker acceptance.
+            res = self._call(
+                fn,
+                payload,
+                retry_on_token_error=False,
+            )
+    
         except BrokerSafetyError:
+            # Preserve the existing adapter's explicit safety/error semantics.
             raise
-        except Exception as e:
-            raise OrderOutcomeUnknown(f"placeOrder raised {type(e).__name__}: {e}") from e
+    
+        except Exception as exc:
+            # The broker may have accepted the order before the exception occurred.
+            # Do not submit it again automatically.
+            raise OrderOutcomeUnknown(
+                f"placeOrder outcome is unknown: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+    
+        # Validate the broker response.
         if isinstance(res, dict):
-            if res.get("status") is False or str(res.get("status")).lower() == "false":
-                raise BrokerSafetyError(f"Order rejected by broker API: {res.get('message')} [{res.get('errorcode')}]")
+    
+            status = res.get("status")
+    
+            # Only an explicit broker rejection is treated as a confirmed rejection.
+            if status is False or (
+                isinstance(status, str)
+                and status.strip().lower() == "false"
+            ):
+                raise BrokerSafetyError(
+                    "Order rejected by broker API: "
+                    f"{res.get('message')} [{res.get('errorcode')}]"
+                )
+    
             data = res.get("data")
-            oid = data.get("orderid") if isinstance(data, dict) else data
+    
+            if isinstance(data, dict):
+                order_id = (
+                    data.get("orderid")
+                    or data.get("order_id")
+                )
+            else:
+                order_id = data
+    
         else:
-            oid = res
-        if not oid:
-            raise OrderOutcomeUnknown(f"No order id in response: {res!r}")
-        return str(oid)
+            # Some SDK versions return the order ID directly.
+            order_id = res
+    
+        # No confirmed order ID means the submission outcome is uncertain.
+        if order_id is None or not str(order_id).strip():
+            raise OrderOutcomeUnknown(
+                f"No order ID returned by Angel One: {res!r}"
+            )
+    
+        return str(order_id).strip()
 
-    def modify_order(self, order_id: str, contract: dict, *, variety: str, order_type: str, product: str,
-                     quantity: int, price: float, trigger_price: float = 0.0, tag: str = "") -> bool:
+
+    
+    def modify_order(
+        self,
+        order_id: str,
+        contract: dict,
+        *,
+        variety: str,
+        order_type: str,
+        product: str,
+        quantity: int,
+        price: float,
+        trigger_price: float = 0.0,
+        tag: str = "",
+    ) -> bool:
         _require_gates(True)
-        params = {"variety": variety, "orderid": order_id, "ordertype": order_type, "producttype": product,
-                  "duration": "DAY", "price": str(tick(price)), "quantity": str(int(quantity)),
-                  "tradingsymbol": contract["tradingsymbol"], "symboltoken": contract["symboltoken"],
-                  "exchange": contract["exchange"]}
-        # Angel One requires the same ordertag on modify requests as the tag
-        # used on the original order. Omitting it can cause a valid SL ratchet
-        # to be rejected by SmartAPI.
+    
+        if not order_id:
+            raise BrokerSafetyError("modify_order requires an order ID")
+    
+        if not isinstance(contract, dict):
+            raise BrokerSafetyError("modify_order requires a valid contract")
+    
+        params = {
+            "variety": variety,
+            "orderid": str(order_id),
+            "ordertype": order_type,
+            "producttype": product,
+            "duration": "DAY",
+            "price": str(tick(price)),
+            "quantity": str(int(quantity)),
+            "tradingsymbol": contract["tradingsymbol"],
+            "symboltoken": contract["symboltoken"],
+            "exchange": contract["exchange"],
+        }
+    
+        # Angel One requires the original ordertag on modification requests.
         if tag:
             params["ordertag"] = str(tag)[:20]
+    
         if trigger_price:
             params["triggerprice"] = str(tick(trigger_price))
-        try:
-            res = self._call("modifyOrder", params, retry_on_token_error=False)
-        except Exception as e:
-            log.error("modifyOrder failed: %s", e)
-            return False
-        return bool(isinstance(res, dict) and res.get("status") is True)
-
-    def cancel_order(self, order_id: str, variety: str = "NORMAL") -> bool:
+    
+        with self._order_book_lock:
+            self.invalidate_order_book_cache()
+    
+            try:
+                res = self._call(
+                    "modifyOrder",
+                    params,
+                    retry_on_token_error=False,
+                )
+    
+                return bool(
+                    isinstance(res, dict)
+                    and res.get("status") is True
+                )
+    
+            except Exception as exc:
+                log.error(
+                    "modifyOrder failed for order %s: %s",
+                    order_id,
+                    exc,
+                )
+                return False
+    
+            finally:
+                self.invalidate_order_book_cache()
+    
+    
+    def cancel_order(
+        self,
+        order_id: str,
+        variety: str = "NORMAL",
+    ) -> bool:
         _require_gates(True)
-        try:
-            res = self._call("cancelOrder", order_id, variety)
-        except Exception as e:
-            log.error("cancelOrder failed: %s", e)
-            return False
-        return bool(isinstance(res, dict) and res.get("status") is True)
+    
+        if not order_id:
+            raise BrokerSafetyError("cancel_order requires an order ID")
+    
+        with self._order_book_lock:
+            self.invalidate_order_book_cache()
+    
+            try:
+                res = self._call(
+                    "cancelOrder",
+                    str(order_id),
+                    variety,
+                    retry_on_token_error=False,
+                )
+    
+                return bool(
+                    isinstance(res, dict)
+                    and res.get("status") is True
+                )
+    
+            except Exception as exc:
+                log.error(
+                    "cancelOrder failed for order %s: %s",
+                    order_id,
+                    exc,
+                )
+                return False
+    
+            finally:
+                self.invalidate_order_book_cache()
+
 
     # ── reads ────────────────────────────────────────────────────────────
-    def order_book(self) -> list:
+    def invalidate_order_book_cache(self):
+        """Invalidate the cached broker order book."""
+        with self._order_book_lock:
+            self._order_book_cache = None
+            self._order_book_cache_at = 0.0
+    
+    
+    def order_book(self, *, force_refresh=False):
         """
-        Fetch and validate broker order book.
+        Return a validated broker order book.
     
-        Never interpret a failed response as an empty order book.
-        Apply progressive backoff after API failures.
+        Ordinary reads:
+            Use the short-lived successful-response cache.
+    
+        Critical reconciliation:
+            Use force_refresh=True to demand a fresh broker response.
+    
+        Fail closed:
+            Never convert a failed or unavailable response into [].
         """
+        with self._order_book_lock:
+            now = time.monotonic()
     
-        now = time.time()
+            # Ordinary reads can reuse a recently successful response.
+            if not force_refresh and self._order_book_cache is not None:
+                age = now - self._order_book_cache_at
     
-        # Avoid repeatedly hitting Angel One during rate limiting.
-        if now < self._order_book_backoff_until:
-            remaining = int(self._order_book_backoff_until - now) + 1
+                if age <= self._order_book_cache_ttl:
+                    return [dict(row) for row in self._order_book_cache]
     
-            raise BrokerSafetyError(
-                f"Order book temporarily unavailable; "
-                f"retry allowed in approximately {remaining} seconds"
-            )
+            # Respect rate-limit and API-failure backoff.
+            wall_now = time.time()
     
-        try:
-            res = self._call("orderBook")
+            if wall_now < self._order_book_backoff_until:
+                remaining = int(
+                    self._order_book_backoff_until - wall_now
+                ) + 1
     
-            if not isinstance(res, dict) or res.get("status") is not True:
                 raise BrokerSafetyError(
-                    f"orderBook failed or status is not true: {res!r}"
+                    "Order book unavailable during broker backoff; "
+                    f"retry allowed in approximately {remaining} seconds"
                 )
     
-            data = res.get("data")
+            try:
+                response = self._call("orderBook")
     
-            if not isinstance(data, list):
-                raise BrokerSafetyError(
-                    "orderBook data is not a confirmed list "
-                    f"(received {type(data).__name__}); "
-                    "manual-order check unavailable"
+                if (
+                    not isinstance(response, dict)
+                    or response.get("status") is not True
+                ):
+                    raise BrokerSafetyError(
+                        f"orderBook failed or status is not true: {response!r}"
+                    )
+    
+                data = response.get("data")
+    
+                if not isinstance(data, list):
+                    raise BrokerSafetyError(
+                        "Order book response is not a confirmed list"
+                    )
+    
+                if any(not isinstance(row, dict) for row in data):
+                    raise BrokerSafetyError(
+                        "Order book contains malformed rows"
+                    )
+    
+                # Copy validated rows before caching.
+                validated = [dict(row) for row in data]
+    
+                # Only successful, validated responses reset backoff.
+                self._order_book_failures = 0
+                self._order_book_backoff_until = 0.0
+    
+                self._order_book_cache = validated
+                self._order_book_cache_at = time.monotonic()
+    
+                return [dict(row) for row in validated]
+    
+            except Exception as exc:
+                self._order_book_cache = None
+                self._order_book_cache_at = 0.0
+    
+                self._order_book_failures += 1
+    
+                delay = min(
+                    30 * (2 ** (self._order_book_failures - 1)),
+                    300,
                 )
     
-            if any(not isinstance(row, dict) for row in data):
-                raise BrokerSafetyError(
-                    "orderBook contains a malformed order row"
+                self._order_book_backoff_until = time.time() + delay
+    
+                log.error(
+                    "Order book unavailable. "
+                    "Failure=%s Backoff=%ss Error=%s",
+                    self._order_book_failures,
+                    delay,
+                    exc,
                 )
     
-            # Successful response resets backoff.
-            self._order_book_failures = 0
-            self._order_book_backoff_until = 0.0
+                if isinstance(exc, BrokerSafetyError):
+                    raise
     
-            return data
-    
-        except BrokerSafetyError as exc:
-            self._order_book_failures += 1
-    
-            # 30, 60, 120, 240, then maximum 300 seconds.
-            delay = min(
-                30 * (2 ** (self._order_book_failures - 1)),
-                300
-            )
-    
-            self._order_book_backoff_until = time.time() + delay
-    
-            log.error(
-                "Order book unavailable. Failure=%s Backoff=%ss Error=%s",
-                self._order_book_failures,
-                delay,
-                exc
-            )
-    
-            raise
+                raise BrokerSafetyError(
+                    f"Order book request failed: {type(exc).__name__}: {exc}"
+                ) from exc
 
     
     def position_book(self) -> list:
@@ -581,13 +791,18 @@ class AngelOneBroker:
             "price": _num(row.get("price"), float, 0.0),
         }
 
-    def orders(self) -> list:
-        return [self._normalise(r) for r in self.order_book()]
-
-    def get_order(self, order_id: str):
-        for o in self.orders():
-            if o["order_id"] == str(order_id):
-                return o
+    def orders(self, *, force_refresh=False):
+        return [
+            self._normalise(row)
+            for row in self.order_book(force_refresh=force_refresh)
+        ]
+    
+    
+    def get_order(self, order_id: str, *, force_refresh=False):
+        for order in self.orders(force_refresh=force_refresh):
+            if order["order_id"] == str(order_id):
+                return order
+    
         return None
 
     @staticmethod
