@@ -55,6 +55,41 @@ def _number(value: Any) -> float | None:
         return None
     return result if isfinite(result) else None
 
+def normalise_contract_identity(contract: dict) -> tuple[str, str, str]:
+    if not isinstance(contract, dict):
+        raise ValueError("Contract must be a dictionary")
+
+    exchange = str(contract.get("exchange") or "").strip().upper()
+    token = str(contract.get("symboltoken") or "").strip()
+    symbol = str(
+        contract.get("tradingsymbol")
+        or contract.get("symbol")
+        or ""
+    ).strip().upper()
+
+    if exchange not in {"NFO", "BFO"}:
+        raise ValueError("Unsupported derivative exchange")
+
+    if not token or not symbol:
+        raise ValueError("Missing contract token or trading symbol")
+
+    return exchange, token, symbol
+
+
+def strict_signed_quantity(value, field="quantity") -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"Invalid {field}")
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"Invalid {field}")
+
+    if not number.is_integer():
+        raise ValueError(f"Non-integer {field}")
+
+    return int(number)
+    
 
 def _integer(value: Any) -> int | None:
     number = _number(value)
@@ -64,10 +99,8 @@ def _integer(value: Any) -> int | None:
 
 
 def contract_key(contract: dict) -> str:
-    """Exact identity; do not match by symbol text alone."""
-    required = ("exchange", "symboltoken", "tradingsymbol")
-    if not isinstance(contract, dict):
-        raise ValueError("contract must be a dict")
+    exchange, token, symbol = normalise_contract_identity(contract)
+    return f"{exchange}:{token}:{symbol}"
 
     values = []
     for field in required:
@@ -128,18 +161,50 @@ def _remaining_qty(order: dict) -> int | None:
     return remaining if remaining >= 0 else None
 
 
-def _valid_open_position(position: dict, lot_size: int) -> tuple[int, float] | None:
+
+def _valid_open_position(
+    position: dict,
+    lot_size: int,
+) -> tuple[int, float] | None:
+    """
+    Validate a broker/engine long-option position.
+
+    Returns:
+        (quantity, average_price) when valid.
+        None when the position is invalid or unsafe to reconcile.
+
+    Safety:
+    - Only positive net quantities are accepted.
+    - Short positions are never converted using abs().
+    - Quantity must be an exact multiple of the contract lot size.
+    - Average price must be finite and positive.
+    """
+
+    if not isinstance(position, dict):
+        return None
+
+    if isinstance(lot_size, bool) or not isinstance(lot_size, int):
+        return None
+
+    if lot_size <= 0:
+        return None
+
     qty = _integer(position.get("net_qty"))
     avg = _number(position.get("average_price"))
 
+    # Reject missing, zero, negative or invalid quantities.
     if qty is None or qty <= 0:
         return None
-    if lot_size <= 0 or qty % lot_size != 0:
-        return None
-    if avg is None or avg <= 0:
-        return None
-    return qty, avg
 
+    # Reject quantities that do not match the contract lot size.
+    if qty % lot_size != 0:
+        return None
+
+    # Reject missing, zero, negative or invalid average prices.
+    if avg is None or not math.isfinite(avg) or avg <= 0:
+        return None
+
+    return int(qty), float(avg)
 
 def _manual_id(key: str) -> str:
     digest = sha256(key.encode("utf-8")).hexdigest()[:20].upper()
