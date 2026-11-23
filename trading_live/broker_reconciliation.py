@@ -6,7 +6,7 @@ All uncertain broker data fails closed.
 """
 
 from __future__ import annotations
-
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -70,6 +70,7 @@ class BrokerSnapshot:
     orders: tuple[dict, ...]
     complete: bool
     error: str | None = None
+    captured_at: float = 0.0
 
 
 class InstrumentMasterIndex:
@@ -239,41 +240,81 @@ class AngelOneReadOnlySnapshotAdapter:
         }
 
     def read_snapshot(self) -> BrokerSnapshot:
-        """Read both books. Either failure invalidates the entire snapshot."""
+        """
+        Read broker positions and orders.
+    
+        Either read failing invalidates the complete snapshot.
+        """
+        captured_at = time.time()
+    
         try:
             raw_positions = self.broker.position_book()
-            raw_orders = self.broker.orders()
-
+    
+            # Force a fresh broker order book for account reconciliation.
+            raw_orders = self.broker.orders(force_refresh=True)
+    
             if not isinstance(raw_positions, list):
-                raise BrokerSafetyError("Position book is not a list")
-
+                raise BrokerSafetyError(
+                    "Position book is not a list"
+                )
+    
             if not isinstance(raw_orders, list):
-                raise BrokerSafetyError("Order book is not a list")
-
+                raise BrokerSafetyError(
+                    "Order book is not a list"
+                )
+    
             positions = tuple(
-                self._normalise_position(row) for row in raw_positions
+                self._normalise_position(row)
+                for row in raw_positions
+                if str(row.get("exchange") or "").upper() in {"NFO", "BFO"}
             )
+    
             orders = tuple(
-                self._normalise_order(row) for row in raw_orders
+                self._normalise_order(row)
+                for row in raw_orders
+                if str(row.get("exchange") or "").upper() in {"NFO", "BFO"}
             )
-
+    
             return BrokerSnapshot(
                 positions=positions,
                 orders=orders,
                 complete=True,
+                captured_at=captured_at,
             )
-
+    
         except Exception as exc:
             return BrokerSnapshot(
                 positions=(),
                 orders=(),
                 complete=False,
                 error=f"{type(exc).__name__}: {exc}",
+                captured_at=captured_at,
             )
 
 
 class ReadOnlyReconciliationCoordinator:
     """Generate plans only. Never mutates broker, store, or engine state."""
+    if not snapshot.complete:
+        return [
+            ReconcileResult(
+                decision="FREEZE",
+                contract_key="ACCOUNT",
+                reason=f"Broker snapshot unavailable: {snapshot.error}",
+                actions=("ALERT_AND_BLOCK_NEW_ACTIVITY",),
+            )
+        ]
+    
+    snapshot_age = time.time() - snapshot.captured_at
+    
+    if snapshot_age < 0 or snapshot_age > 5:
+        return [
+            ReconcileResult(
+                decision="FREEZE",
+                contract_key="ACCOUNT",
+                reason=f"Broker snapshot is stale: {snapshot_age:.2f}s",
+                actions=("ALERT_AND_BLOCK_NEW_ACTIVITY",),
+            )
+        ]
 
     def __init__(self, *, adapter, store):
         self.adapter = adapter
