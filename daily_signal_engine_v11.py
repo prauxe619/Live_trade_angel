@@ -216,8 +216,8 @@ _signal_persistence_failed = threading.Event()
 # ─────────────────────────────────────────────────────────────
 
 STRONG_BK_MIN_BARS = 20
-STRONG_BK_VOLUME_MULT = 1.50
-STRONG_BK_MIN_BODY_RATIO = 0.60
+STRONG_BK_VOLUME_MULT = 1.70
+STRONG_BK_MIN_BODY_RATIO = 0.65
 STRONG_BK_MAX_EXTENSION_ATR = 0.75
 STRONG_BK_RETEST_ATR = 0.20
 STRONG_BK_RETEST_MAX_AGE_SEC = 900
@@ -2882,16 +2882,19 @@ class StrategyEngine:
                 return result
 
             # New bullish breakout.
+            breakout_buffer = atr * STRONG_BK_MIN_BREAKOUT_ATR
+
+            # New bullish breakout.
             bullish = (
-                float(last["close"]) > resistance
+                float(last["close"]) > resistance + breakout_buffer
                 and float(last["close"]) > float(last["open"])
                 and body_ratio >= STRONG_BK_MIN_BODY_RATIO
                 and volume_ratio >= STRONG_BK_VOLUME_MULT
             )
-
+            
             # New bearish breakout.
             bearish = (
-                float(last["close"]) < support
+                float(last["close"]) < support - breakout_buffer
                 and float(last["close"]) < float(last["open"])
                 and body_ratio >= STRONG_BK_MIN_BODY_RATIO
                 and volume_ratio >= STRONG_BK_VOLUME_MULT
@@ -4825,24 +4828,33 @@ class DailySignalEngine:
             })
 
             # 14. Notify only after successful registration.
+            sl_price = max(0.0, float(entry_prem) - float(sniper["sl_pts"]))
+            target_price = float(entry_prem) + float(sniper["tp_pts"])
+            
+            action = "BUY CALL" if expected_direction == "CE" else "BUY PUT"
+            direction_emoji = "🟢" if expected_direction == "CE" else "🔴"
+            
             _to_vip(
-                f"🚀 *STRONG BREAKOUT — RETEST ENTRY*\\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━\\n"
-                f"*{cfg['label']}*\\n"
-                f"Direction: *{expected_direction}*\\n"
-                f"Strike: `{selected_strike}`\\n"
-                f"Expiry: `{trade_expiry}`\\n"
-                f"Spot: `{spot:.2f}`\\n"
-                f"Breakout Level: `{level:.2f}`\\n"
-                f"Entry Premium: `₹{entry_prem:.2f}`\\n"
-                f"Probability: `{prob:.3f}`\\n"
-                f"Volume: `{breakout['volume_ratio']:.2f}x`\\n"
-                f"SL: `{sniper['sl_pts']}` premium points\\n"
-                f"Target: `{sniper['tp_pts']}` premium points\\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━\\n"
-                f"Entry: *Confirmed retest*\\n"
-                f"Signal: `{sig_id}`\\n"
-                f"🕒 `{_now()}`"
+                f"🚀 <b>STRONG BREAKOUT SIGNAL</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"{direction_emoji} <b>{cfg['label']} — {action}</b>\n"
+                f"<b>{selected_strike} {expected_direction}</b>\n"
+                f"Expiry: <code>{trade_expiry}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📥 <b>ENTRY</b>     ₹{entry_prem:.2f}\n"
+                f"🛑 <b>STOP LOSS</b> ₹{sl_price:.2f}\n"
+                f"🎯 <b>TARGET</b>    ₹{target_price:.2f}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 Spot: <code>{spot:.2f}</code>\n"
+                f"Breakout: <code>{level:.2f}</code>\n"
+                f"Volume: <b>{breakout['volume_ratio']:.2f}x</b>\n"
+                f"Candle Strength: <b>{breakout['body_ratio']:.2f}</b>\n"
+                f"Probability: <b>{prob:.1%}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ <b>SETUP: RETEST CONFIRMED</b>\n"
+                f"⚠️ Signal registered — broker fill not confirmed.\n"
+                f"<code>{sig_id}</code>\n"
+                f"🕒 {_now()}"
             )
 
             _log.info(
