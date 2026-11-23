@@ -17,6 +17,10 @@ from .lot_config import configured_live_lots
 from .angel_one_broker import (AngelOneBroker, BrokerSafetyError, OrderOutcomeUnknown,
                                tick, kill_switch_on, engine_expiry_to_master)
 from .live_state import MemoryStore, PgStore, list_active, today_ist
+from .broker_reconciliation import (
+    AngelOneReadOnlySnapshotAdapter,
+    ReadOnlyReconciliationCoordinator,
+)
 
 log = logging.getLogger("black.live")
 IST = ZoneInfo("Asia/Kolkata")
@@ -397,6 +401,87 @@ class LiveBridge:
             raise BrokerSafetyError(f"Pre-trade risk rejected: {exc}") from exc
         return {"approved": True, "limits": order_check, "money": money_check,
                 "available_cash": available_cash}
+     
+    def _validate_account_reconciliation(self):
+        """
+        Block new BUY orders unless the entire broker account
+        is reconciled against bot-managed positions and orders.
+        """
+
+        if self.store is None:
+            raise BrokerSafetyError(
+                "Account reconciliation blocked: live store is unavailable"
+            )
+
+        try:
+            # Reuse the existing Angel One instrument master.
+            master_path = AngelOneBroker.download_master(
+                self.cfg.master_path
+            )
+
+            with open(master_path, "r", encoding="utf-8") as f:
+                master_data = json.load(f)
+
+            master_rows = (
+                master_data
+                if isinstance(master_data, list)
+                else master_data.get("data")
+                if isinstance(master_data, dict)
+                else None
+            )
+
+            if not isinstance(master_rows, list):
+                raise BrokerSafetyError(
+                    "Instrument master has an invalid structure"
+                )
+
+            instrument_master = InstrumentMasterIndex(master_rows)
+
+            adapter = AngelOneReadOnlySnapshotAdapter(
+                broker=self.broker,
+                instrument_master=instrument_master,
+            )
+
+            coordinator = ReadOnlyReconciliationCoordinator(
+                adapter=adapter,
+                store=self.store,
+            )
+
+            results = coordinator.plan()
+
+            if not isinstance(results, list):
+                raise BrokerSafetyError(
+                    "Account reconciliation returned an invalid result"
+                )
+
+            # Only explicitly unchanged positions are safe.
+            blocked = [
+                result
+                for result in results
+                if getattr(result, "decision", None) != "UNCHANGED"
+            ]
+
+            if blocked:
+                reasons = "; ".join(
+                    f"{getattr(item, 'contract_key', 'UNKNOWN')}: "
+                    f"{getattr(item, 'reason', 'Unresolved reconciliation')}"
+                    for item in blocked[:5]
+                )
+
+                raise BrokerSafetyError(
+                    "Account-wide reconciliation blocked new entry: "
+                    + reasons
+                )
+
+        except BrokerSafetyError:
+            raise
+
+        except Exception as exc:
+            raise BrokerSafetyError(
+                "Account-wide reconciliation failed safely: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
 
     # ══ ENTRY ════════════════════════════════════════════════════════════
     def open_position(self, sig: dict) -> dict | None:
@@ -636,6 +721,8 @@ class LiveBridge:
                     self._save(pos)
                     self._alert(f"ENTRY BLOCKED: existing broker exposure/order for {contract['tradingsymbol']}")
                     return pos
+            # Account-wide exact position/order reconciliation.
+            self._validate_account_reconciliation()
             oid = self.broker.place_order(payload)
         except OrderOutcomeUnknown as e:
             if intent_id:
