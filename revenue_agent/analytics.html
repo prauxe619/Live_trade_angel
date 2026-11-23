@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BLACK — Strategy Lab · Desk Analytics</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg0:#050710;--bg1:#090c18;--bg2:#0e1220;--bg3:#141929;
+  --border:#1a2138;--border2:#1e2b4a;
+  --text0:#e4ecff;--text1:#8a97c0;--text2:#4a5470;
+  --accent:#3b82f6;--accent2:#60a5fa;--green:#22c55e;--red:#ef4444;--gold:#f59e0b;--purple:#a78bfa;--cyan:#22d3ee;--orange:#f97316;
+  --font-mono:'JetBrains Mono',monospace;--font-display:'Syne',sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg0);color:var(--text0);font-family:var(--font-mono);font-size:12px;min-height:100vh}
+body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
+  background-image:linear-gradient(rgba(59,130,246,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(59,130,246,.02) 1px,transparent 1px);background-size:40px 40px}
+header{position:sticky;top:0;z-index:50;display:flex;align-items:center;justify-content:space-between;padding:11px 20px;border-bottom:1px solid var(--border);background:rgba(5,7,16,.97);backdrop-filter:blur(10px)}
+.logo-area{display:flex;align-items:center;gap:20px}
+.logo{font-family:var(--font-display);font-size:18px;font-weight:800;letter-spacing:.18em;display:flex;align-items:center;gap:10px}
+.logo-dot{width:8px;height:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 12px var(--accent)}
+.version-badge{font-size:9px;font-weight:700;letter-spacing:.1em;padding:2px 7px;border-radius:2px;background:rgba(245,158,11,.15);color:var(--gold);border:1px solid rgba(245,158,11,.25)}
+.nav-switcher{display:flex;gap:6px;background:var(--bg2);padding:3px;border:1px solid var(--border);border-radius:3px}
+.nav-switcher a{text-decoration:none;padding:4px 10px;font-size:9px;font-weight:700;color:var(--text2);border-radius:2px}
+.nav-switcher a.active{color:var(--text0);background:var(--accent)}
+.hdr-right{display:flex;align-items:center;gap:14px;font-size:10px;color:var(--text1)}
+.logout{padding:6px 10px;border:1px solid var(--border2);border-radius:6px;color:var(--text1);font-size:11px;text-decoration:none}
+
+.wrap{position:relative;z-index:5;max-width:1560px;margin:0 auto;padding:16px 20px 60px}
+.filters{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:12px 14px;margin-bottom:14px}
+.f{display:flex;flex-direction:column;gap:4px}
+.f label{font-size:8.5px;font-weight:700;letter-spacing:.14em;color:var(--text2);text-transform:uppercase}
+.f select,.f input{background:var(--bg2);border:1px solid var(--border2);color:var(--text0);font:inherit;font-size:11px;padding:6px 8px;border-radius:3px;min-width:100px}
+.f input[type=range]{padding:0;min-width:120px}
+.btn{background:var(--bg3);border:1px solid var(--border2);color:var(--accent2);font:inherit;font-size:10px;font-weight:700;letter-spacing:.06em;padding:7px 11px;border-radius:3px;cursor:pointer}
+.btn:hover{border-color:var(--accent)}
+.btn.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.spacer{flex:1}
+
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--border);border:1px solid var(--border);border-radius:4px;overflow:hidden;margin-bottom:14px}
+.kpi{background:var(--bg1);padding:12px 14px;display:flex;flex-direction:column;gap:5px;cursor:help}
+.kpi .l{font-size:8.5px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--text2)}
+.kpi .v{font-size:21px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1}
+.kpi .s{font-size:9.5px;color:var(--text2)}
+
+.grid{display:grid;gap:14px;margin-bottom:14px}
+.g2{grid-template-columns:1fr 1fr}.g3{grid-template-columns:1fr 1fr 1fr}.g21{grid-template-columns:2fr 1fr}.g12{grid-template-columns:1fr 2fr}
+@media(max-width:1100px){.g2,.g3,.g21,.g12{grid-template-columns:1fr}}
+.card{background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow:hidden;min-width:0}
+.card-h{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 14px;background:var(--bg2);border-bottom:1px solid var(--border)}
+.card-t{font-family:var(--font-display);font-size:10px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--text1)}
+.card-sub{font-size:9px;color:var(--text2)}
+.card-b{padding:12px 14px}
+.card-b.flush{padding:0}
+canvas{display:block;width:100%}
+.note{font-size:9.5px;color:var(--text2);line-height:1.6;margin-top:8px}
+
+.pos{color:var(--green)}.neg{color:var(--red)}.neu{color:var(--text1)}.gold{color:var(--gold)}.blue{color:var(--accent2)}.purple{color:var(--purple)}
+
+/* insights */
+.insight{display:flex;gap:10px;padding:9px 14px;border-bottom:1px solid rgba(26,33,56,.5);align-items:flex-start;line-height:1.55}
+.insight:last-child{border-bottom:none}
+.tag{flex-shrink:0;font-size:8px;font-weight:700;letter-spacing:.1em;padding:2px 6px;border-radius:2px;margin-top:2px;min-width:52px;text-align:center}
+.tag.edge{background:rgba(34,197,94,.14);color:var(--green)}
+.tag.risk{background:rgba(239,68,68,.14);color:var(--red)}
+.tag.action{background:rgba(59,130,246,.15);color:var(--accent2)}
+.tag.note{background:rgba(245,158,11,.14);color:var(--gold)}
+.tag.data{background:rgba(167,139,250,.14);color:var(--purple)}
+.insight b{color:var(--text0);font-weight:600}.insight span.t{color:var(--text1)}
+
+/* tables */
+.tbl{width:100%;border-collapse:collapse}
+.tbl th{position:sticky;top:0;padding:7px 10px;font-size:8.5px;font-weight:700;letter-spacing:.13em;color:var(--text2);text-transform:uppercase;text-align:right;background:var(--bg2);border-bottom:1px solid var(--border);white-space:nowrap;cursor:pointer;user-select:none}
+.tbl th:first-child,.tbl td:first-child{text-align:left}
+.tbl th:hover{color:var(--accent2)}
+.tbl td{padding:7px 10px;font-size:11px;border-bottom:1px solid rgba(26,33,56,.5);text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.tbl tr:hover td{background:rgba(59,130,246,.04)}
+.scroll{max-height:420px;overflow:auto}
+.scroll::-webkit-scrollbar{width:3px;height:3px}.scroll::-webkit-scrollbar-thumb{background:var(--border2)}
+.inbar{position:relative;display:inline-block;min-width:92px;text-align:right}
+.inbar i{position:absolute;top:1px;bottom:1px;opacity:.16;border-radius:2px}
+.tabs{display:flex;flex-wrap:wrap;gap:4px}
+.tabs .btn{padding:5px 9px;font-size:9px}
+
+/* heatmap */
+.heat{border-collapse:separate;border-spacing:3px;width:100%}
+.heat th{font-size:9px;color:var(--text2);font-weight:600;padding:2px 4px;text-align:center}
+.heat th.rl{text-align:right;white-space:nowrap}
+.heat td{height:34px;text-align:center;font-size:10px;border-radius:3px;font-variant-numeric:tabular-nums;background:var(--bg2);color:var(--text2);min-width:48px}
+.heat td small{display:block;font-size:8px;opacity:.7}
+.cal{display:grid;grid-template-rows:repeat(5,15px);grid-auto-flow:column;grid-auto-columns:15px;gap:3px;overflow-x:auto;padding-bottom:6px}
+.cal div{border-radius:2px;background:var(--bg3)}
+.legend{display:flex;gap:10px;align-items:center;font-size:9px;color:var(--text2);margin-top:8px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:middle}
+
+/* calibration + dq rows */
+.row2{display:grid;grid-template-columns:70px 1fr 120px;gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid rgba(26,33,56,.4);font-size:10.5px}
+.meter{position:relative;height:8px;background:var(--bg3);border-radius:4px;overflow:visible}
+.meter b{position:absolute;left:0;top:0;bottom:0;border-radius:4px}
+.meter u{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--gold);text-decoration:none}
+.kv{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(26,33,56,.4);font-size:10.5px;color:var(--text1)}
+.kv b{color:var(--text0);font-weight:600}
+.empty{padding:34px 16px;text-align:center;color:var(--text2);font-size:11px;line-height:1.7}
+#tip{position:fixed;z-index:200;pointer-events:none;background:#0b1020;border:1px solid var(--border2);padding:6px 9px;border-radius:3px;font-size:10px;color:var(--text0);display:none;white-space:pre;line-height:1.5}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo-area">
+    <div class="logo"><div class="logo-dot"></div>BLACK<span style="font-weight:400;color:var(--text2);font-size:12px;letter-spacing:.04em">/ STRATEGY LAB</span><span class="version-badge">DESK ANALYTICS</span></div>
+    <div class="nav-switcher"><a href="/">⚡ TERMINAL</a><a href="/analytics" class="active">📈 STRATEGY LAB</a></div>
+  </div>
+  <div class="hdr-right"><span id="updated">loading…</span><a class="logout" href="/auth/logout">↪ LOG OUT</a></div>
+</header>
+
+<div class="wrap">
+  <!-- FILTERS -->
+  <div class="filters">
+    <div class="f"><label>From</label><input type="date" id="fFrom"></div>
+    <div class="f"><label>To</label><input type="date" id="fTo"></div>
+    <div class="f"><label>Index</label><select id="fIndex"><option value="">All</option></select></div>
+    <div class="f"><label>Signal type</label><select id="fType"><option value="">All</option></select></div>
+    <div class="f"><label>Direction</label><select id="fDir"><option value="">All</option><option>CE</option><option>PE</option></select></div>
+    <div class="f"><label>Channel</label><select id="fChan"><option value="">All</option></select></div>
+    <div class="f"><label>Min conviction <span id="fProbV" class="blue">0%</span></label><input type="range" id="fProb" min="0" max="80" step="1" value="0"></div>
+    <div class="spacer"></div>
+    <button class="btn" data-preset="all">ALL</button>
+    <button class="btn" data-preset="30">30D</button>
+    <button class="btn" data-preset="7">7D</button>
+    <button class="btn" data-preset="1">TODAY</button>
+    <button class="btn" id="btnCsv">⬇ CSV</button>
+  </div>
+
+  <div class="kpis" id="kpis"></div>
+
+  <!-- INSIGHTS -->
+  <div class="grid g21">
+    <div class="card"><div class="card-h"><div class="card-t">🧠 Desk Read — auto-generated findings</div><div class="card-sub" id="insSub"></div></div><div id="insights"></div></div>
+    <div class="card"><div class="card-h"><div class="card-t">Statistical Confidence</div></div><div class="card-b" id="confidence"></div></div>
+  </div>
+
+  <!-- EQUITY -->
+  <div class="grid g21">
+    <div class="card"><div class="card-h"><div class="card-t">Equity Curve & Drawdown</div><div class="card-sub">per closed trade · hover for detail</div></div><div class="card-b"><canvas id="cEq"></canvas><canvas id="cDD" style="margin-top:6px"></canvas></div></div>
+    <div class="card"><div class="card-h"><div class="card-t">Daily P&L</div><div class="card-sub" id="dailySub"></div></div><div class="card-b"><canvas id="cDaily"></canvas><div class="note" id="dailyNote"></div></div></div>
+  </div>
+
+  <div class="grid g2">
+    <div class="card"><div class="card-h"><div class="card-t">Rolling Edge (last 20 trades)</div><div class="card-sub">is the edge decaying?</div></div><div class="card-b"><canvas id="cRollE"></canvas><canvas id="cRollW" style="margin-top:6px"></canvas></div></div>
+    <div class="card"><div class="card-h"><div class="card-t">Daily P&L Calendar</div><div class="card-sub">columns = weeks · rows Mon→Fri</div></div><div class="card-b"><div id="cal"></div><div class="legend"><span><i style="background:rgba(239,68,68,.8)"></i>loss</span><span><i style="background:var(--bg3)"></i>no trades</span><span><i style="background:rgba(34,197,94,.8)"></i>profit</span></div></div></div>
+  </div>
+
+  <!-- EDGE MAP -->
+  <div class="grid g2">
+    <div class="card"><div class="card-h"><div class="card-t">Edge Map · Hour × Weekday</div><div class="card-sub">net ₹ (trade count)</div></div><div class="card-b" id="heatHW"></div></div>
+    <div class="card"><div class="card-h"><div class="card-t">Edge Map · Index × Signal Type</div><div class="card-sub">expectancy ₹/trade (trade count)</div></div><div class="card-b" id="heatIT"></div></div>
+  </div>
+
+  <!-- BREAKDOWN -->
+  <div class="card" style="margin-bottom:14px">
+    <div class="card-h"><div class="card-t">Attribution Desk</div><div class="tabs" id="bdTabs"></div></div>
+    <div class="card-b flush scroll"><table class="tbl" id="bdTable"></table></div>
+  </div>
+
+  <!-- CONVICTION -->
+  <div class="grid g2">
+    <div class="card"><div class="card-h"><div class="card-t">Conviction Calibration</div><div class="card-sub">engine probability vs realised win rate</div></div><div class="card-b" id="calib"></div></div>
+    <div class="card"><div class="card-h"><div class="card-t">Conviction Threshold Optimiser</div><div class="card-sub">what if the engine only fired above X%?</div></div><div class="card-b flush scroll"><table class="tbl" id="thTable"></table></div><div class="card-b" style="padding-top:0"><div class="note" id="thNote"></div></div></div>
+  </div>
+
+  <!-- RISK LAB -->
+  <div class="grid g3">
+    <div class="card"><div class="card-h"><div class="card-t">R-Multiple Distribution</div><div class="card-sub" id="rSub"></div></div><div class="card-b"><canvas id="cR"></canvas></div></div>
+    <div class="card"><div class="card-h"><div class="card-t">₹ P&L Distribution</div></div><div class="card-b"><canvas id="cPnl"></canvas></div></div>
+    <div class="card"><div class="card-h"><div class="card-t">Streaks & Sizing</div></div><div class="card-b" id="streaks"></div></div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <div class="card-h"><div class="card-t">Monte-Carlo Risk Lab</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <div class="f" style="flex-direction:row;align-items:center;gap:6px"><label>Capital ₹</label><input type="number" id="mcCap" value="100000" style="min-width:90px;width:100px"></div>
+        <div class="f" style="flex-direction:row;align-items:center;gap:6px"><label>Horizon</label><input type="number" id="mcH" value="100" style="min-width:60px;width:64px"></div>
+        <div class="f" style="flex-direction:row;align-items:center;gap:6px"><label>Ruin at -%</label><input type="number" id="mcRuin" value="30" style="min-width:50px;width:54px"></div>
+        <button class="btn" id="mcRun">RE-RUN</button>
+      </div></div>
+    <div class="grid g21" style="margin:0"><div class="card-b"><canvas id="cMC"></canvas></div><div class="card-b" id="mcStats"></div></div>
+  </div>
+
+  <!-- EXITS -->
+  <div class="grid g2">
+    <div class="card"><div class="card-h"><div class="card-t">Exit Efficiency</div></div><div class="card-b flush"><table class="tbl" id="exitTable"></table><div class="card-b" id="exitExtra"></div></div></div>
+    <div class="card"><div class="card-h"><div class="card-t">Time-in-Trade vs Outcome</div></div><div class="card-b flush"><table class="tbl" id="holdTable"></table><div class="card-b" id="targetFunnel"></div></div></div>
+  </div>
+
+  <div class="grid g2">
+    <div class="card"><div class="card-h"><div class="card-t">🏆 Top 5 Winners</div></div><div class="card-b flush"><table class="tbl" id="topW"></table></div></div>
+    <div class="card"><div class="card-h"><div class="card-t">💸 Top 5 Losers</div></div><div class="card-b flush"><table class="tbl" id="topL"></table></div></div>
+  </div>
+
+  <div class="card"><div class="card-h"><div class="card-t">Data Quality & Coverage</div><div class="card-sub">what the engine actually recorded vs what is derived</div></div><div class="card-b" id="dq"></div></div>
+</div>
+<div id="tip"></div>
+
+<script>
+/* ═══════════════ helpers ═══════════════ */
+const $ = id => document.getElementById(id);
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const inr = v => (v == null || !isFinite(v)) ? '—' : (v < 0 ? '-' : '') + '₹' + Math.abs(Math.round(v)).toLocaleString('en-IN');
+const inrs = v => (v == null || !isFinite(v)) ? '—' : (v > 0 ? '+' : v < 0 ? '-' : '') + '₹' + Math.abs(Math.round(v)).toLocaleString('en-IN');
+const pct = (v, d = 1) => (v == null || !isFinite(v)) ? '—' : v.toFixed(d) + '%';
+const num = (v, d = 2) => (v == null || !isFinite(v)) ? (v === Infinity ? '∞' : '—') : v.toFixed(d);
+const cls = v => v > 0 ? 'pos' : v < 0 ? 'neg' : 'neu';
+const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+const MIN_N = 5;
+
+function parseTs(ts, fallbackDate) {
+  const str = String(ts || '');
+  const m = str.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}):(\d{2})/);
+  if (!m) return fallbackDate ? { date: String(fallbackDate).slice(0, 10), hour: null, min: 0 } : null;
+  if (/(Z|[+-]\d{2}:?\d{2})$/.test(str)) {
+    const d = new Date(str);
+    if (!isNaN(d)) {
+      const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(d).map(x => [x.type, x.value]));
+      return { date: `${p.year}-${p.month}-${p.day}`, hour: +p.hour, min: +p.minute };
+    }
+  }
+  return { date: m[1], hour: +m[2], min: +m[3] };
+}
+const dowOf = date => new Date(date + 'T12:00:00Z').getUTCDay();
+const normProb = v => { let p = Math.abs(Number(v) || 0); if (p > 1) p /= 100; return p > 0 ? p : null; };
+const mean = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
+const std = a => { if (a.length < 2) return 0; const m = mean(a); return Math.sqrt(a.reduce((s, x) => s + (x - m) ** 2, 0) / (a.length - 1)); };
+
+function exitClass(o, pnl) {
+  o = (o || '').toUpperCase();
+  if (!o) return 'UNKNOWN';
+  if (o.includes('TARGET')) return 'TARGET';
+  if (o.includes('TRAIL')) return 'TRAILED';
+  if (o.includes('REVERSAL')) return 'REVERSAL';
+  if (o.includes('SL')) return pnl > 0 ? 'SL (in profit)' : 'SL HIT';
+  if (/FORCE|EOD|CLOSE|TIME|EXPIR/.test(o)) return 'TIME / EOD';
+  return o;
+}
+
+function normTrade(s) {
+  const p = parseTs(s.timestamp, s.date);
+  if (!p) return null;
+  const tm = Date.UTC(+p.date.slice(0, 4), +p.date.slice(5, 7) - 1, +p.date.slice(8, 10), p.hour || 0, p.min || 0);
+  const pnl = Number(s.pnl_inr ?? s.rupee_pnl);
+  const out = {
+    id: s.signal_id || s.id, ts: s.timestamp, date: p.date, hour: p.hour, tm,
+    dow: dowOf(p.date), index: (s.index || s.label || 'UNKNOWN').toUpperCase(),
+    type: (s.signal_type || 'UNKNOWN').toUpperCase(), dir: (s.direction || '?').toUpperCase(),
+    channel: (s.channel || 'VIP').toUpperCase(), regime: (s.regime || 'UNKNOWN').toUpperCase(),
+    trigger: (s.trigger || 'fresh').toLowerCase(), outcome: (s.outcome || '').toUpperCase(),
+    pnl, pts: s.pnl_pts == null ? null : Number(s.pnl_pts), prob: normProb(s.prob),
+    entry: Number(s.entry || s.entry_price || 0), exit: Number(s.exit || s.exit_price || 0),
+    r: s.r_multiple == null ? null : Number(s.r_multiple), hold: s.hold_minutes == null ? null : Number(s.hold_minutes),
+    mfe: s.mfe_pts == null ? null : Number(s.mfe_pts), peak: Number(s.peak || 0), qty: Number(s.quantity || 0),
+    moonbag: !!s.moonbag, targets: Array.isArray(s.targets) ? s.targets : [], derived: Array.isArray(s.derived) ? s.derived : [],
+    stateFound: !!s.state_found, slPrice: Number(s.sl_price || 0), strike: s.strike, spot: Number(s.spot || 0)
+  };
+  out.exitClass = exitClass(out.outcome, pnl);
+  return out;
+}
+
+/* ═══════════════ statistics ═══════════════ */
+function calc(rows) {
+  const n = rows.length;
+  const o = { n, wins: 0, losses: 0, flat: 0, net: 0, gw: 0, gl: 0, wr: 0, pf: 0, exp: 0, avgW: 0, avgL: 0, payoff: 0, maxDD: 0, ddNow: 0, sharpe: null, sortino: null, t: null, wLo: 0, wHi: 0, kelly: 0, avgR: null, avgHold: null, recovery: 0, best: null, worst: null };
+  if (!n) return o;
+  const rs = [...rows].sort((a, b) => a.tm - b.tm);
+  let eq = 0, peak = 0;
+  const pnls = [], daily = {};
+  for (const t of rs) {
+    pnls.push(t.pnl);
+    if (t.pnl > 0) { o.wins++; o.gw += t.pnl; } else if (t.pnl < 0) { o.losses++; o.gl += -t.pnl; } else o.flat++;
+    eq += t.pnl; if (eq > peak) peak = eq; if (eq - peak < o.maxDD) o.maxDD = eq - peak;
+    daily[t.date] = (daily[t.date] || 0) + t.pnl;
+  }
+  o.net = eq; o.ddNow = eq - peak; o.peakEq = peak;
+  o.wr = o.wins / n * 100;
+  o.pf = o.gl ? o.gw / o.gl : (o.gw ? Infinity : 0);
+  o.exp = eq / n;
+  o.avgW = o.wins ? o.gw / o.wins : 0;
+  o.avgL = o.losses ? -o.gl / o.losses : 0;
+  o.payoff = o.avgL ? o.avgW / Math.abs(o.avgL) : 0;
+  const sd = std(pnls);
+  o.sd = sd;
+  o.t = sd ? o.exp / (sd / Math.sqrt(n)) : null;
+  const z = 1.96, p = o.wins / n, den = 1 + z * z / n, ctr = (p + z * z / (2 * n)) / den, half = z * Math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den;
+  o.wLo = (ctr - half) * 100; o.wHi = (ctr + half) * 100;
+  const dv = Object.values(daily); o.days = dv.length; o.dailyArr = dv;
+  if (dv.length >= 5) {
+    const dm = mean(dv), ds = std(dv), dd = Math.sqrt(mean(dv.map(x => Math.min(0, x) ** 2)));
+    o.sharpe = ds ? dm / ds * Math.sqrt(252) : null;
+    o.sortino = dd ? dm / dd * Math.sqrt(252) : null;
+  }
+  o.kelly = o.payoff ? (o.wr / 100 - (1 - o.wr / 100) / o.payoff) * 100 : 0;
+  const rr = rows.filter(t => t.r != null).map(t => t.r);
+  if (rr.length) { o.avgR = mean(rr); o.sdR = std(rr); o.nR = rr.length; }
+  const hh = rows.filter(t => t.hold != null).map(t => t.hold);
+  if (hh.length) o.avgHold = mean(hh);
+  o.recovery = o.maxDD ? o.net / Math.abs(o.maxDD) : 0;
+  o.best = rs.reduce((a, b) => b.pnl > a.pnl ? b : a); o.worst = rs.reduce((a, b) => b.pnl < a.pnl ? b : a);
+  // SQN: Van Tharp on R-multiples when available, else on rupee P&L normalised by average loss
+  if (o.nR >= Math.max(10, n * 0.5) && o.sdR) o.sqn = Math.sqrt(o.nR) * o.avgR / o.sdR;
+  else if (sd) o.sqn = Math.sqrt(n) * o.exp / sd;
+  return o;
+}
+const groupBy = (rows, fn) => { const m = new Map(); rows.forEach(t => { const k = fn(t); if (k == null) return; if (!m.has(k)) m.set(k, []); m.get(k).push(t); }); return [...m].map(([key, r]) => ({ key, rows: r, ...calc(r) })); };
+
+/* ═══════════════ state / filters ═══════════════ */
+let ALL = [], F = [], bdTab = 'Index';
+const filt = { from: '', to: '', index: '', type: '', dir: '', chan: '', prob: 0 };
+
+function applyFilters() {
+  F = ALL.filter(t => (!filt.from || t.date >= filt.from) && (!filt.to || t.date <= filt.to) && (!filt.index || t.index === filt.index) && (!filt.type || t.type === filt.type) && (!filt.dir || t.dir === filt.dir) && (!filt.chan || t.channel === filt.chan) && (!filt.prob || (t.prob != null && t.prob * 100 >= filt.prob)));
+  F.sort((a, b) => a.tm - b.tm);
+}
+function fillSelect(id, vals) {
+  const el = $(id), cur = el.value;
+  el.innerHTML = '<option value="">All</option>' + [...new Set(vals)].sort().map(v => `<option>${esc(v)}</option>`).join('');
+  el.value = cur;
+}
+function bindFilters() {
+  const map = { fFrom: 'from', fTo: 'to', fIndex: 'index', fType: 'type', fDir: 'dir', fChan: 'chan' };
+  Object.entries(map).forEach(([id, k]) => $(id).addEventListener('change', e => { filt[k] = e.target.value; renderAll(); }));
+  $('fProb').addEventListener('input', e => { filt.prob = +e.target.value; $('fProbV').textContent = filt.prob + '%'; renderAll(); });
+  document.querySelectorAll('[data-preset]').forEach(b => b.addEventListener('click', () => {
+    const v = b.dataset.preset, last = ALL.length ? ALL[ALL.length - 1].date : new Date().toISOString().slice(0, 10);
+    if (v === 'all') { filt.from = ''; filt.to = ''; }
+    else { const d = new Date(last + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() - (+v - 1)); filt.from = d.toISOString().slice(0, 10); filt.to = ''; }
+    $('fFrom').value = filt.from; $('fTo').value = filt.to; renderAll();
+  }));
+  $('btnCsv').addEventListener('click', exportCsv);
+  $('mcRun').addEventListener('click', () => renderMC());
+}
+function exportCsv() {
+  const cols = ['ts', 'index', 'type', 'dir', 'strike', 'channel', 'regime', 'trigger', 'prob', 'entry', 'exit', 'pts', 'pnl', 'r', 'hold', 'outcome', 'exitClass', 'qty', 'mfe', 'moonbag'];
+  const lines = [cols.join(',')].concat(F.map(t => cols.map(c => { const v = t[c]; return /[",\n]/.test(String(v ?? '')) ? '"' + String(v).replace(/"/g, '""') + '"' : (v ?? ''); }).join(',')));
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/csv' }));
+  a.download = 'black_trades_' + new Date().toISOString().slice(0, 10) + '.csv'; a.click();
+}
+
+/* ═══════════════ chart primitives ═══════════════ */
+const tip = $('tip');
+function showTip(e, txt) { tip.textContent = txt; tip.style.display = 'block'; tip.style.left = Math.min(e.clientX + 14, innerWidth - 220) + 'px'; tip.style.top = (e.clientY + 14) + 'px'; }
+const hideTip = () => tip.style.display = 'none';
+
+function prep(id, h) {
+  const c = $(id), w = c.parentElement.clientWidth - (c.parentElement.classList.contains('card-b') ? 28 : 0), dpr = window.devicePixelRatio || 1;
+  c.width = w * dpr; c.height = h * dpr; c.style.width = w + 'px'; c.style.height = h + 'px';
+  const ctx = c.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
+  return { c, ctx, w, h };
+}
+function niceTicks(min, max, n = 4) {
+  if (min === max) { min -= 1; max += 1; }
+  const step = Math.pow(10, Math.floor(Math.log10((max - min) / n))), err = (max - min) / n / step;
+  const m = err >= 7.5 ? 10 : err >= 3.5 ? 5 : err >= 1.5 ? 2 : 1, s = m * step;
+  const out = []; for (let v = Math.ceil(min / s) * s; v <= max + 1e-9; v += s) out.push(v); return out;
+}
+const short = v => Math.abs(v) >= 1e5 ? (v / 1e5).toFixed(1) + 'L' : Math.abs(v) >= 1e3 ? (v / 1e3).toFixed(1) + 'k' : v.toFixed(Math.abs(v) < 10 && v % 1 ? 1 : 0);
+
+function emptyChart(id, h, msg) {
+  const { ctx, w } = prep(id, h);
+  ctx.fillStyle = '#4a5470'; ctx.font = '11px JetBrains Mono'; ctx.textAlign = 'center'; ctx.fillText(msg, w / 2, h / 2);
+}
+
+function lineChart(id, h, o) {
+  // o: series[{y,color,fill,width}], labels[], bands[{lo,hi,color}], fmt, zero, minY, maxY
+  const { c, ctx, w } = prep(id, h);
+  const L = 46, R = 10, T = 8, B = 18, N = o.series[0].y.length;
+  if (N < 2) return emptyChart(id, h, 'Not enough data');
+  let lo = Infinity, hi = -Infinity;
+  o.series.forEach(s => s.y.forEach(v => { lo = Math.min(lo, v); hi = Math.max(hi, v); }));
+  (o.bands || []).forEach(b => { b.lo.forEach(v => lo = Math.min(lo, v)); b.hi.forEach(v => hi = Math.max(hi, v)); });
+  if (o.zero) { lo = Math.min(lo, 0); hi = Math.max(hi, 0); }
+  if (o.minY != null) lo = o.minY; if (o.maxY != null) hi = o.maxY;
+  const pad = (hi - lo) * 0.06 || 1; if (o.minY == null) lo -= pad; if (o.maxY == null) hi += pad;
+  const X = i => L + i * (w - L - R) / (N - 1), Y = v => T + (hi - v) * (h - T - B) / (hi - lo);
+  const fmt = o.fmt || short;
+  const draw = hv => {
+    ctx.clearRect(0, 0, w, h);
+    ctx.font = '9px JetBrains Mono'; ctx.textAlign = 'right'; ctx.fillStyle = '#4a5470'; ctx.strokeStyle = '#141929'; ctx.lineWidth = 1;
+    niceTicks(lo, hi).forEach(v => { ctx.beginPath(); ctx.moveTo(L, Y(v)); ctx.lineTo(w - R, Y(v)); ctx.stroke(); ctx.fillText(fmt(v), L - 5, Y(v) + 3); });
+    if (o.zero && lo < 0 && hi > 0) { ctx.strokeStyle = '#2a3658'; ctx.setLineDash([3, 4]); ctx.beginPath(); ctx.moveTo(L, Y(0)); ctx.lineTo(w - R, Y(0)); ctx.stroke(); ctx.setLineDash([]); }
+    ctx.textAlign = 'center'; ctx.fillStyle = '#4a5470';
+    if (o.labels) { const k = Math.min(5, N - 1); for (let j = 0; j <= k; j++) { const i = Math.round(j * (N - 1) / k); ctx.fillText(String(o.labels[i]).slice(0, 10), X(i), h - 4); } }
+    (o.bands || []).forEach(b => { ctx.beginPath(); b.hi.forEach((v, i) => i ? ctx.lineTo(X(i), Y(v)) : ctx.moveTo(X(i), Y(v))); for (let i = N - 1; i >= 0; i--) ctx.lineTo(X(i), Y(b.lo[i])); ctx.closePath(); ctx.fillStyle = b.color; ctx.fill(); });
+    o.series.forEach(s => {
+      ctx.beginPath(); s.y.forEach((v, i) => i ? ctx.lineTo(X(i), Y(v)) : ctx.moveTo(X(i), Y(v)));
+      if (s.fill) { ctx.save(); ctx.lineTo(X(N - 1), Y(Math.max(lo, Math.min(0, hi)))); ctx.lineTo(X(0), Y(Math.max(lo, Math.min(0, hi)))); ctx.closePath(); const g = ctx.createLinearGradient(0, T, 0, h - B); g.addColorStop(0, s.color + '33'); g.addColorStop(1, s.color + '00'); ctx.fillStyle = g; ctx.fill(); ctx.restore(); ctx.beginPath(); s.y.forEach((v, i) => i ? ctx.lineTo(X(i), Y(v)) : ctx.moveTo(X(i), Y(v))); }
+      ctx.strokeStyle = s.color; ctx.lineWidth = s.width || 1.5; ctx.stroke();
+    });
+    if (hv != null) {
+      ctx.strokeStyle = '#3b4a78'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(X(hv), T); ctx.lineTo(X(hv), h - B); ctx.stroke();
+      o.series.forEach(s => { ctx.fillStyle = s.color; ctx.beginPath(); ctx.arc(X(hv), Y(s.y[hv]), 3, 0, 7); ctx.fill(); });
+    }
+  };
+  draw(null);
+  c.onmousemove = e => {
+    const r = c.getBoundingClientRect(), i = Math.max(0, Math.min(N - 1, Math.round((e.clientX - r.left - L) / (w - L - R) * (N - 1))));
+    draw(i);
+    showTip(e, (o.labels ? o.labels[i] + '\n' : '') + o.series.map(s => (s.name ? s.name + ': ' : '') + fmt(s.y[i])).join('\n'));
+  };
+  c.onmouseleave = () => { draw(null); hideTip(); };
+}
+
+function barChart(id, h, vals, labels, o = {}) {
+  const { c, ctx, w } = prep(id, h);
+  const n = vals.length; if (!n) return emptyChart(id, h, 'No data');
+  const L = 44, R = 8, T = 8, B = 20;
+  let lo = Math.min(0, ...vals), hi = Math.max(0, ...vals); if (hi === lo) hi = lo + 1;
+  const Y = v => T + (hi - v) * (h - T - B) / (hi - lo), bw = (w - L - R) / n, fmt = o.fmt || short;
+  const draw = hv => {
+    ctx.clearRect(0, 0, w, h); ctx.font = '9px JetBrains Mono'; ctx.textAlign = 'right'; ctx.fillStyle = '#4a5470'; ctx.strokeStyle = '#141929';
+    niceTicks(lo, hi).forEach(v => { ctx.beginPath(); ctx.moveTo(L, Y(v)); ctx.lineTo(w - R, Y(v)); ctx.stroke(); ctx.fillText(fmt(v), L - 5, Y(v) + 3); });
+    vals.forEach((v, i) => {
+      const x = L + i * bw + bw * 0.12, ww = Math.max(1, bw * 0.76), col = o.colors ? o.colors[i] : (v >= 0 ? '#22c55e' : '#ef4444');
+      ctx.globalAlpha = hv === i ? 1 : 0.8; ctx.fillStyle = col; ctx.fillRect(x, Math.min(Y(v), Y(0)), ww, Math.max(1, Math.abs(Y(v) - Y(0)))); ctx.globalAlpha = 1;
+    });
+    ctx.fillStyle = '#4a5470'; ctx.textAlign = 'center';
+    const every = Math.ceil(n / Math.max(1, Math.floor((w - L - R) / 46)));
+    labels.forEach((lb, i) => { if (i % every === 0) ctx.fillText(String(lb), L + i * bw + bw / 2, h - 5); });
+  };
+  draw(null);
+  c.onmousemove = e => { const r = c.getBoundingClientRect(), i = Math.floor((e.clientX - r.left - L) / bw); if (i >= 0 && i < n) { draw(i); showTip(e, (o.tipLabel ? o.tipLabel(i) : labels[i] + '\n' + fmt(vals[i]))); } };
+  c.onmouseleave = () => { draw(null); hideTip(); };
+}
+
+function heat(el, rows, cols, cell, fmtV) {
+  let max = 1;
+  rows.forEach(r => cols.forEach(c => { const x = cell(r, c); if (x && x.n) max = Math.max(max, Math.abs(x.v)); }));
+  let h = '<table class="heat"><tr><th></th>' + cols.map(c => `<th>${esc(c.label ?? c)}</th>`).join('') + '</tr>';
+  rows.forEach(r => {
+    h += `<tr><th class="rl">${esc(r.label ?? r)}</th>`;
+    cols.forEach(c => {
+      const x = cell(r, c);
+      if (!x || !x.n) { h += '<td>·</td>'; return; }
+      const a = Math.min(0.85, 0.12 + Math.abs(x.v) / max * 0.75), col = x.v >= 0 ? `rgba(34,197,94,${a})` : `rgba(239,68,68,${a})`;
+      h += `<td style="background:${col};color:#fff" title="${esc(x.tip || '')}">${fmtV(x.v)}<small>n=${x.n}</small></td>`;
+    });
+    h += '</tr>';
+  });
+  el.innerHTML = h + '</table>';
+}
+
+function sortableTable(id, cols, rows, o = {}) {
+  const el = $(id); let sk = o.sort || cols.find(c => c.k !== 'key')?.k, dir = o.dir || -1;
+  const render = () => {
+    const rs = [...rows].sort((a, b) => { const x = a[sk], y = b[sk]; if (typeof x === 'string' || typeof y === 'string') return dir * String(x).localeCompare(String(y), undefined, { numeric: true }); return dir * ((x === Infinity ? 1e12 : x ?? -1e12) - (y === Infinity ? 1e12 : y ?? -1e12)); });
+    const mx = {}; cols.forEach(c => { if (c.bar) mx[c.k] = Math.max(1, ...rows.map(r => Math.abs(r[c.k] || 0))); });
+    el.innerHTML = '<thead><tr>' + cols.map(c => `<th data-k="${c.k}" title="${esc(c.tip || '')}">${esc(c.label)}${sk === c.k ? (dir < 0 ? ' ▼' : ' ▲') : ''}</th>`).join('') + '</tr></thead><tbody>' +
+      (rs.length ? rs.map(r => '<tr>' + cols.map(c => {
+        const v = r[c.k], txt = c.fmt ? c.fmt(v, r) : esc(v), kc = c.color ? c.color(v, r) : '';
+        const bar = c.bar ? `<i style="${v >= 0 ? 'right:0' : 'left:0'};width:${Math.abs(v || 0) / mx[c.k] * 100}%;background:${v >= 0 ? 'var(--green)' : 'var(--red)'}"></i>` : '';
+        return `<td class="${kc}">${c.bar ? `<span class="inbar">${bar}${txt}</span>` : txt}</td>`;
+      }).join('') + '</tr>').join('') : `<tr><td colspan="${cols.length}" class="empty">No data for this view</td></tr>`) + '</tbody>';
+    el.querySelectorAll('th').forEach(th => th.onclick = () => { const k = th.dataset.k; if (sk === k) dir = -dir; else { sk = k; dir = k === 'key' ? 1 : -1; } render(); });
+  };
+  render();
+}
+
+/* ═══════════════ render sections ═══════════════ */
+function renderKPIs(st) {
+  const k = (l, v, s, c, tipTxt) => `<div class="kpi" title="${esc(tipTxt)}"><div class="l">${l}</div><div class="v ${c || ''}">${v}</div><div class="s">${s}</div></div>`;
+  $('kpis').innerHTML = [
+    k('Net P&L', inrs(st.net), `${st.n} closed trades · ${st.days || 0} days`, cls(st.net), 'Sum of realised ₹ P&L for the filtered trades'),
+    k('Win rate', pct(st.wr), `95% CI ${pct(st.wLo, 0)}–${pct(st.wHi, 0)}`, st.wr >= 50 ? 'pos' : 'neu', 'Wilson 95% confidence interval — the honest range the true win rate sits in given your sample size'),
+    k('Profit factor', num(st.pf), `gross ${inr(st.gw)} / ${inr(st.gl)}`, st.pf >= 1.3 ? 'pos' : st.pf >= 1 ? 'gold' : 'neg', 'Gross profit ÷ gross loss. Desks usually want >1.3 after costs'),
+    k('Expectancy', inrs(st.exp), 'per trade', cls(st.exp), 'Average ₹ made per trade = win% × avg win − loss% × avg loss'),
+    k('Payoff ratio', num(st.payoff), `avg win ${inr(st.avgW)} · avg loss ${inr(st.avgL)}`, st.payoff >= 1 ? 'pos' : 'gold', 'Average win ÷ average loss'),
+    k('Max drawdown', inr(st.maxDD), `now ${inr(st.ddNow)} from peak`, 'neg', 'Largest peak-to-trough fall of the cumulative P&L (trade-by-trade, chronological)'),
+    k('Recovery factor', num(st.recovery), 'net ÷ max DD', st.recovery >= 3 ? 'pos' : st.recovery >= 1 ? 'gold' : 'neg', 'How many times the strategy has earned back its worst drawdown'),
+    k('Sharpe (daily)', num(st.sharpe), st.sharpe == null ? 'needs ≥5 trading days' : 'annualised ×√252', st.sharpe >= 1 ? 'pos' : st.sharpe > 0 ? 'gold' : 'neg', 'Mean daily P&L ÷ std of daily P&L, annualised. Scale-free, so no capital figure needed'),
+    k('Sortino', num(st.sortino), 'downside only', st.sortino >= 1.5 ? 'pos' : st.sortino > 0 ? 'gold' : 'neg', 'Like Sharpe but only penalises losing days'),
+    k('SQN', num(st.sqn), st.sqn >= 3 ? 'excellent' : st.sqn >= 2 ? 'good' : st.sqn >= 1.6 ? 'average' : 'weak', st.sqn >= 2 ? 'pos' : st.sqn >= 1 ? 'gold' : 'neg', 'Van Tharp System Quality Number. <1.6 poor, 2–2.5 good, 3+ excellent'),
+    k('Kelly (half)', st.kelly > 0 ? pct(st.kelly / 2) : '0%', `full ${pct(st.kelly)}`, st.kelly > 0 ? 'blue' : 'neg', 'Theoretical optimal fraction of capital to risk per trade. Use HALF Kelly at most, and treat with scepticism on small samples'),
+    k('Avg R', st.avgR == null ? '—' : (st.avgR >= 0 ? '+' : '') + st.avgR.toFixed(2) + 'R', st.nR ? `${st.nR} trades with SL data` : 'no SL data', st.avgR > 0 ? 'pos' : st.avgR < 0 ? 'neg' : '', 'Average P&L in multiples of the risk taken (entry − stop)'),
+    k('Avg hold', st.avgHold == null ? '—' : st.avgHold >= 60 ? (st.avgHold / 60).toFixed(1) + ' h' : Math.round(st.avgHold) + ' min', 'entry → exit', '', 'Average time between entry and exit')
+  ].join('');
+}
+
+function renderConfidence(st) {
+  if (st.n < 3) { $('confidence').innerHTML = '<div class="empty">Need more closed trades.</div>'; return; }
+  const sig = st.t != null && Math.abs(st.t) >= 1.96;
+  const need = st.exp > 0 && st.sd ? Math.ceil((1.96 * st.sd / st.exp) ** 2) : null;
+  $('confidence').innerHTML = `
+    <div class="kv"><span>Sample size</span><b class="${st.n >= 100 ? 'pos' : st.n >= 30 ? 'gold' : 'neg'}">${st.n} trades ${st.n >= 100 ? '· solid' : st.n >= 30 ? '· thin' : '· too small'}</b></div>
+    <div class="kv"><span>t-stat of expectancy</span><b class="${sig ? 'pos' : 'gold'}">${num(st.t)}</b></div>
+    <div class="kv"><span>Edge significant at 95%?</span><b class="${sig ? (st.exp > 0 ? 'pos' : 'neg') : 'gold'}">${sig ? (st.exp > 0 ? 'YES — positive edge' : 'YES — negative edge') : 'NOT YET'}</b></div>
+    <div class="kv"><span>Win-rate floor (95%)</span><b>${pct(st.wLo)}</b></div>
+    <div class="kv"><span>Break-even win rate @ payoff ${num(st.payoff)}</span><b>${st.payoff ? pct(100 / (1 + st.payoff)) : '—'}</b></div>
+    <div class="kv"><span>Trades needed to prove edge</span><b>${need ? (need > st.n ? '~' + need + ' (' + (need - st.n) + ' more)' : 'reached') : '—'}</b></div>
+    <div class="note">The t-stat asks: could this average ₹/trade be luck? |t| &lt; 1.96 means yes, it still could. A profitable-looking curve on a small sample is not an edge until this turns green.</div>`;
+}
+
+/* ---- insights ---- */
+function pRun(n, k, p) { // P(at least one run of k losses in n trades) where P(loss)=p
+  const s = new Array(k).fill(0); s[0] = 1; let hit = 0;
+  for (let i = 0; i < n; i++) { const nx = new Array(k).fill(0); for (let j = 0; j < k; j++) { nx[0] += s[j] * (1 - p); if (j + 1 < k) nx[j + 1] += s[j] * p; else hit += s[j] * p; } for (let j = 0; j < k; j++) s[j] = nx[j]; }
+  return hit;
+}
+function buildInsights(rows, st) {
+  const I = [], add = (tag, html) => I.push({ tag, html });
+  if (!rows.length) return I;
+  if (st.n < 30) add('note', `<b>Small sample (${st.n} trades).</b> <span class="t">Every conclusion below is directional only. Treat percentages with the confidence intervals shown, not as facts.</span>`);
+  add(st.exp > 0 ? 'edge' : 'risk', `<b>${st.exp > 0 ? 'Positive' : 'Negative'} expectancy of ${inrs(st.exp)} per trade</b> <span class="t">— ${pct(st.wr)} win rate (floor ${pct(st.wLo, 0)}) with payoff ${num(st.payoff)}; profit factor ${num(st.pf)}. ${st.t != null ? (Math.abs(st.t) >= 1.96 ? 'Statistically significant (t=' + num(st.t) + ').' : 'Not yet statistically significant (t=' + num(st.t) + ').') : ''}</span>`);
+  const grp = (fn, min = MIN_N) => groupBy(rows, fn).filter(g => g.n >= min);
+  const bw = (arr, key = 'net') => arr.length > 1 ? [arr.reduce((a, b) => b[key] > a[key] ? b : a), arr.reduce((a, b) => b[key] < a[key] ? b : a)] : null;
+  const dim = (name, fn, fmtK = k => k) => { const g = grp(fn), x = bw(g); if (!x || x[0].key === x[1].key) return; const [b, w] = x;
+    if (w.net < 0) add('action', `<b>${name}: ${esc(fmtK(w.key))} is bleeding</b> <span class="t">— ${inrs(w.net)} over ${w.n} trades (${pct(w.wr, 0)} win, PF ${num(w.pf)}). Best is <b>${esc(fmtK(b.key))}</b> at ${inrs(b.net)} (PF ${num(b.pf)}). Consider throttling or filtering ${esc(fmtK(w.key))}.</span>`);
+    else if (b.net > 0) add('edge', `<b>${name}: ${esc(fmtK(b.key))} carries the book</b> <span class="t">— ${inrs(b.net)} over ${b.n} trades (PF ${num(b.pf)}); weakest ${esc(fmtK(w.key))} still ${inrs(w.net)}.</span>`); };
+  dim('Index', t => t.index); dim('Signal type', t => t.type); dim('Direction', t => t.dir); dim('Regime', t => t.regime === 'UNKNOWN' ? null : t.regime);
+  dim('Hour', t => t.hour == null ? null : t.hour, k => String(k).padStart(2, '0') + ':00');
+  dim('Weekday', t => (t.dow >= 1 && t.dow <= 5) ? t.dow : null, k => DAYS[k]);
+
+  // convex "lottery" profiles
+  groupBy(rows, t => t.type).filter(g => g.n >= MIN_N && g.wr < 40 && g.payoff >= 2).forEach(g => add('note', `<b>${esc(g.key)} is a convex bet</b> <span class="t">— only ${pct(g.wr, 0)} win rate but ${num(g.payoff)}× payoff. It lives or dies on the right tail: size it small and don't judge it over a few trades.</span>`));
+
+  // exit structure
+  const ec = groupBy(rows, t => t.exitClass), slh = ec.find(g => g.key === 'SL HIT');
+  if (slh && st.gl > 0 && slh.gl / st.gl > 0.7) add('risk', `<b>Stop-outs are ${pct(slh.gl / st.gl * 100, 0)} of all gross losses</b> <span class="t">— ${slh.n} SL hits cost ${inr(-slh.gl)}. Check whether entries are early (price tags SL then reverses) before widening stops.</span>`);
+  const rev = ec.find(g => g.key === 'REVERSAL' && g.n >= MIN_N); if (rev) add(rev.net >= 0 ? 'edge' : 'risk', `<b>Reversal exits</b> <span class="t">net ${inrs(rev.net)} over ${rev.n} trades (avg ${inrs(rev.exp)}) — ${rev.net >= 0 ? 'the reversal rule is adding value vs. riding to SL.' : 'the reversal rule is costing money; test a stricter threshold.'}</span>`);
+
+  // loss tail
+  if (st.avgL && st.worst.pnl < 3 * st.avgL && st.losses >= 3) add('risk', `<b>Tail loss: ${inr(st.worst.pnl)}</b> <span class="t">is ${(st.worst.pnl / st.avgL).toFixed(1)}× your average loss (${esc(st.worst.index)} ${esc(st.worst.type)} on ${esc(st.worst.date)}). Slippage/gap beyond the planned stop — review fills on that trade.</span>`);
+
+  // concentration
+  const sorted = [...rows].sort((a, b) => b.pnl - a.pnl);
+  if (st.net > 0 && sorted.length >= 8) { const top3 = sorted.slice(0, 3).reduce((s, t) => s + t.pnl, 0); if (top3 / st.net > 0.6) add('risk', `<b>Profit concentration</b> <span class="t">— the best 3 trades make ${pct(top3 / st.net * 100, 0)} of net P&L. Without them the book makes ${inrs(st.net - top3)}. A fragile edge until the winners broaden.</span>`); }
+
+  // conviction
+  const withP = rows.filter(t => t.prob != null);
+  if (withP.length >= 12) {
+    const med = [...withP].map(t => t.prob).sort((a, b) => a - b)[Math.floor(withP.length / 2)], hi = calc(withP.filter(t => t.prob >= med)), lo = calc(withP.filter(t => t.prob < med));
+    if (hi.n >= 5 && lo.n >= 5) add(hi.exp > lo.exp ? 'edge' : 'risk', `<b>Conviction ${hi.exp > lo.exp ? 'is' : 'is NOT'} predictive</b> <span class="t">— top-half conviction (≥${pct(med * 100, 0)}) averages ${inrs(hi.exp)}/trade vs ${inrs(lo.exp)} for the bottom half. ${hi.exp > lo.exp ? 'Raising the threshold should help; see the optimiser.' : 'The probability model is not separating winners from losers — recalibrate before trusting thresholds.'}</span>`);
+    const th = thresholds(rows).best; if (th) add('action', `<b>Optimiser suggests a ${pct(th.th * 100, 1)} floor</b> <span class="t">— keeps ${th.n} trades with ${inrs(th.exp)}/trade and PF ${num(th.pf)} (vs ${inrs(st.exp)} now). In-sample only: confirm on new trades before applying.</span>`);
+  }
+
+  // drawdown state
+  if (st.maxDD < 0 && st.ddNow < 0 && Math.abs(st.ddNow) > 0.6 * Math.abs(st.maxDD)) add('risk', `<b>Currently in deep drawdown</b> <span class="t">— ${inr(st.ddNow)} below peak, ${pct(Math.abs(st.ddNow / st.maxDD) * 100, 0)} of the worst on record (${inr(st.maxDD)}).</span>`);
+  else if (st.ddNow === 0 && st.n > 5) add('edge', `<b>At equity high</b> <span class="t">— cumulative P&L is at its peak (${inr(st.peakEq)}).</span>`);
+
+  // overtrading
+  const byDay = groupBy(rows, t => t.date), busy = byDay.filter(d => d.n >= 4), calm = byDay.filter(d => d.n < 4);
+  if (busy.length >= 3 && calm.length >= 3) { const b = mean(busy.map(d => d.net)), c = mean(calm.map(d => d.net)); if (b < c - 1) add('action', `<b>Busy days underperform</b> <span class="t">— days with ≥4 trades average ${inrs(b)} vs ${inrs(c)} on quieter days. More signals ≠ more edge; consider a daily cap.</span>`); }
+
+  // streak risk
+  if (st.n >= 15 && st.losses > 0) { const pl = st.losses / st.n, p5 = pRun(20, 5, pl); add(p5 > 0.2 ? 'risk' : 'note', `<b>Loss-streak risk</b> <span class="t">— at a ${pct(pl * 100, 0)} loss rate there is a ${pct(p5 * 100, 0)} chance of a 5-trade losing run within any 20 trades. Size so that run is survivable.</span>`); }
+  return I;
+}
+function renderInsights(rows, st) {
+  const I = buildInsights(rows, st);
+  $('insSub').textContent = I.length + ' findings';
+  $('insights').innerHTML = I.length ? I.map(i => `<div class="insight"><span class="tag ${i.tag}">${i.tag.toUpperCase()}</span><div>${i.html}</div></div>`).join('') : '<div class="empty">No closed trades match the filters.</div>';
+}
+
+/* ---- equity / daily / rolling ---- */
+function renderEquity(rows) {
+  if (rows.length < 2) { emptyChart('cEq', 190, 'Need ≥2 closed trades'); emptyChart('cDD', 80, ''); return; }
+  let eq = 0, pk = 0; const E = [], D = [], lb = [];
+  rows.forEach(t => { eq += t.pnl; pk = Math.max(pk, eq); E.push(eq); D.push(eq - pk); lb.push(t.date + ' ' + (t.hour != null ? String(t.hour).padStart(2, '0') + ':' : '') + ` ${t.index} ${t.type}`); });
+  lineChart('cEq', 190, { series: [{ y: E, color: eq >= 0 ? '#22c55e' : '#ef4444', fill: true, name: 'Cum P&L' }], labels: lb, fmt: inr, zero: true, labelSlice: 0 });
+  lineChart('cDD', 80, { series: [{ y: D, color: '#ef4444', fill: true, name: 'Drawdown' }], labels: lb, fmt: inr, maxY: 0 });
+}
+function renderDaily(rows, st) {
+  const days = groupBy(rows, t => t.date).sort((a, b) => a.key.localeCompare(b.key));
+  $('dailySub').textContent = days.length + ' trading days';
+  if (!days.length) { emptyChart('cDaily', 190, 'No data'); $('dailyNote').textContent = ''; return; }
+  barChart('cDaily', 190, days.map(d => d.net), days.map(d => d.key.slice(5)), { fmt: inr, tipLabel: i => `${days[i].key} ${DAYS[dowOf(days[i].key)]}\n${inrs(days[i].net)} · ${days[i].n} trades · ${pct(days[i].wr, 0)} win` });
+  const g = days.filter(d => d.net > 0).length;
+  $('dailyNote').innerHTML = `Green days <b class="pos">${g}</b> / ${days.length} (${pct(g / days.length * 100, 0)}) · best <b class="pos">${inrs(Math.max(...days.map(d => d.net)))}</b> · worst <b class="neg">${inrs(Math.min(...days.map(d => d.net)))}</b> · avg ${inrs(mean(days.map(d => d.net)))}`;
+}
+function renderRolling(rows) {
+  const w = Math.min(20, Math.floor(rows.length / 2));
+  if (w < 5) { emptyChart('cRollE', 110, 'Need ≥10 trades'); emptyChart('cRollW', 80, ''); return; }
+  const E = [], W = [], lb = [];
+  for (let i = w - 1; i < rows.length; i++) { const s = rows.slice(i - w + 1, i + 1); E.push(mean(s.map(t => t.pnl))); W.push(s.filter(t => t.pnl > 0).length / w * 100); lb.push(rows[i].date); }
+  lineChart('cRollE', 110, { series: [{ y: E, color: '#60a5fa', name: 'Expectancy ₹' }], labels: lb, fmt: inr, zero: true });
+  lineChart('cRollW', 80, { series: [{ y: W, color: '#a78bfa', name: 'Win %' }], labels: lb, fmt: v => v.toFixed(0) + '%', minY: 0, maxY: 100 });
+}
+function renderCalendar(rows) {
+  const el = $('cal'); if (!rows.length) { el.innerHTML = '<div class="empty">No data</div>'; return; }
+  const dm = {}; rows.forEach(t => { dm[t.date] = dm[t.date] || { net: 0, n: 0 }; dm[t.date].net += t.pnl; dm[t.date].n++; });
+  const first = rows[0].date, d0 = new Date(first + 'T12:00:00Z'); d0.setUTCDate(d0.getUTCDate() - ((d0.getUTCDay() + 6) % 7));
+  const last = new Date(rows[rows.length - 1].date + 'T12:00:00Z'), mx = Math.max(1, ...Object.values(dm).map(v => Math.abs(v.net)));
+  let h = '<div class="cal">';
+  for (let d = new Date(d0), guard = 0; d <= last && guard < 400; d.setUTCDate(d.getUTCDate() + 1), guard++) {
+    const wd = d.getUTCDay(); if (wd === 0 || wd === 6) continue;
+    const k = d.toISOString().slice(0, 10), v = dm[k], col = v ? (v.net >= 0 ? `rgba(34,197,94,${0.2 + Math.abs(v.net) / mx * 0.7})` : `rgba(239,68,68,${0.2 + Math.abs(v.net) / mx * 0.7})`) : '';
+    h += `<div title="${k} ${DAYS[wd]}${v ? ' · ' + inrs(v.net) + ' · ' + v.n + ' trades' : ' · no trades'}" style="${col ? 'background:' + col : ''}"></div>`;
+  }
+  el.innerHTML = h + '</div>';
+}
+
+/* ---- heatmaps ---- */
+function renderHeat(rows) {
+  const hours = [...new Set(rows.filter(t => t.hour != null).map(t => t.hour))].sort((a, b) => a - b);
+  const hw = {}; rows.forEach(t => { if (t.hour == null || t.dow < 1 || t.dow > 5) return; const k = t.hour + '_' + t.dow; (hw[k] = hw[k] || []).push(t); });
+  if (!hours.length) $('heatHW').innerHTML = '<div class="empty">No time-of-day data</div>';
+  else heat($('heatHW'), hours.map(h => ({ label: String(h).padStart(2, '0') + ':00', h })), [1, 2, 3, 4, 5].map(d => ({ label: DAYS[d], d })), (r, c) => { const a = hw[r.h + '_' + c.d]; if (!a) return null; const s = calc(a); return { v: s.net, n: s.n, tip: `${s.n} trades · win ${pct(s.wr, 0)} · PF ${num(s.pf)}` }; }, v => (v > 0 ? '+' : '') + short(v));
+  const idx = [...new Set(rows.map(t => t.index))].sort(), types = [...new Set(rows.map(t => t.type))].sort();
+  if (!idx.length) $('heatIT').innerHTML = '<div class="empty">No data</div>';
+  else heat($('heatIT'), idx.map(i => ({ label: i, i })), types.map(t => ({ label: t, t })), (r, c) => { const a = rows.filter(t => t.index === r.i && t.type === c.t); if (!a.length) return null; const s = calc(a); return { v: s.exp, n: s.n, tip: `net ${inrs(s.net)} · win ${pct(s.wr, 0)} · PF ${num(s.pf)}` }; }, v => (v > 0 ? '+' : '') + short(v));
+}
+
+/* ---- attribution ---- */
+const BD = {
+  'Index': t => t.index, 'Signal type': t => t.type, 'Direction': t => t.dir, 'Regime': t => t.regime, 'Exit reason': t => t.exitClass,
+  'Trigger': t => t.trigger, 'Channel': t => t.channel, 'Hour': t => t.hour == null ? null : String(t.hour).padStart(2, '0') + ':00',
+  'Weekday': t => (t.dow >= 1 && t.dow <= 5) ? DAYS[t.dow] : null,
+  'Conviction': t => t.prob == null ? 'n/a' : t.prob < .5 ? '<50%' : t.prob < .55 ? '50-55%' : t.prob < .6 ? '55-60%' : t.prob < .65 ? '60-65%' : t.prob < .7 ? '65-70%' : '70%+',
+  'Moonbag': t => t.moonbag ? 'Moonbag' : 'Standard'
+};
+function renderBreakdown() {
+  $('bdTabs').innerHTML = Object.keys(BD).map(k => `<button class="btn ${k === bdTab ? 'on' : ''}" data-k="${k}">${k}</button>`).join('');
+  $('bdTabs').querySelectorAll('button').forEach(b => b.onclick = () => { bdTab = b.dataset.k; renderBreakdown(); });
+  const g = groupBy(F, BD[bdTab]);
+  const natural = ['Hour', 'Weekday', 'Conviction'].includes(bdTab);
+  sortableTable('bdTable', [
+    { k: 'key', label: bdTab }, { k: 'n', label: 'Trades' }, { k: 'wr', label: 'Win %', fmt: v => pct(v, 0), color: v => v >= 50 ? 'pos' : 'neu' },
+    { k: 'net', label: 'Net ₹', fmt: inrs, color: cls, bar: true }, { k: 'exp', label: 'Expect ₹', fmt: inrs, color: cls },
+    { k: 'pf', label: 'PF', fmt: v => num(v), color: v => v >= 1.3 ? 'pos' : v >= 1 ? 'gold' : 'neg' },
+    { k: 'payoff', label: 'Payoff', fmt: v => num(v) }, { k: 'avgW', label: 'Avg win', fmt: inr, color: () => 'pos' }, { k: 'avgL', label: 'Avg loss', fmt: inr, color: () => 'neg' },
+    { k: 'maxDD', label: 'Max DD', fmt: inr, color: () => 'neg' }, { k: 'avgR', label: 'Avg R', fmt: v => v == null ? '—' : v.toFixed(2), color: v => cls(v) },
+    { k: 'wLo', label: 'Win floor', fmt: v => pct(v, 0), tip: '95% Wilson lower bound' }
+  ], g, natural ? { sort: 'key', dir: 1 } : { sort: 'net', dir: -1 });
+}
+
+/* ---- conviction ---- */
+function thresholds(rows) {
+  const withP = rows.filter(t => t.prob != null), out = [];
+  for (let th = 0.5; th <= 0.80001; th += 0.025) out.push({ th, ...calc(withP.filter(t => t.prob >= th - 1e-9)) });
+  const minN = Math.max(10, Math.ceil(withP.length * 0.2));
+  const cand = out.filter(x => x.n >= minN && x.pf >= 1);
+  return { rows: out, best: cand.length ? cand.reduce((a, b) => b.exp > a.exp ? b : a) : null, minN, total: withP.length };
+}
+function renderConviction(rows) {
+  const withP = rows.filter(t => t.prob != null);
+  if (withP.length < 5) { $('calib').innerHTML = '<div class="empty">Not enough trades with a recorded probability.</div>'; $('thTable').innerHTML = ''; $('thNote').textContent = ''; return; }
+  const bk = [['<50%', 0, .5], ['50-55%', .5, .55], ['55-60%', .55, .6], ['60-65%', .6, .65], ['65-70%', .65, .7], ['70%+', .7, 2]];
+  let h = '<div class="row2" style="color:var(--text2);font-size:9px"><span>BUCKET</span><span>realised win % (bar) vs engine avg (gold tick)</span><span style="text-align:right">n · gap</span></div>';
+  bk.forEach(([l, a, b]) => {
+    const s = withP.filter(t => t.prob >= a && t.prob < b); if (!s.length) return;
+    const c = calc(s), pr = mean(s.map(t => t.prob)) * 100, gap = c.wr - pr;
+    h += `<div class="row2"><span>${l}</span><div class="meter"><b style="width:${c.wr}%;background:${gap >= -5 ? 'var(--green)' : 'var(--red)'};opacity:.75"></b><u style="left:${pr}%"></u></div><span style="text-align:right">${c.n} · <b class="${gap >= 0 ? 'pos' : 'neg'}">${gap >= 0 ? '+' : ''}${gap.toFixed(0)}pt</b></span></div>`;
+  });
+  const calAll = calc(withP), avgP = mean(withP.map(t => t.prob)) * 100;
+  $('calib').innerHTML = h + `<div class="note">Overall the engine averaged <b>${pct(avgP, 0)}</b> conviction and realised <b class="${calAll.wr >= avgP ? 'pos' : 'neg'}">${pct(calAll.wr, 0)}</b> win rate → ${calAll.wr >= avgP - 3 ? 'reasonably calibrated.' : 'overconfident: conviction overstates the true hit rate. Treat the score as a ranking, not a probability.'} Buckets with few trades are noisy.</div>`;
+  const T = thresholds(rows);
+  sortableTable('thTable', [
+    { k: 'th', label: 'Min conviction', fmt: v => pct(v * 100, 1) }, { k: 'n', label: 'Trades' }, { k: 'wr', label: 'Win %', fmt: v => pct(v, 0) },
+    { k: 'net', label: 'Net ₹', fmt: inrs, color: cls }, { k: 'exp', label: 'Expect ₹', fmt: inrs, color: cls }, { k: 'pf', label: 'PF', fmt: num, color: v => v >= 1.3 ? 'pos' : v >= 1 ? 'gold' : 'neg' }, { k: 'maxDD', label: 'Max DD', fmt: inr, color: () => 'neg' }
+  ], T.rows.filter(r => r.n > 0), { sort: 'th', dir: 1 });
+  $('thNote').innerHTML = T.best ? `Best by expectancy with ≥${T.minN} trades: <b class="blue">≥ ${pct(T.best.th * 100, 1)}</b> → ${T.best.n} trades, ${inrs(T.best.exp)}/trade, PF ${num(T.best.pf)}. ⚠ In-sample: picking the best threshold on past data overfits. Validate forward before changing the engine.` : 'No threshold with enough trades and PF ≥ 1 — raising the bar does not currently help.';
+}
+
+/* ---- risk lab ---- */
+function renderDistributions(rows, st) {
+  const rr = rows.filter(t => t.r != null).map(t => t.r);
+  $('rSub').textContent = rr.length ? rr.length + ' trades with defined risk' : '';
+  const hist = (arr, step, id, fmt) => {
+    if (arr.length < 3) return emptyChart(id, 180, 'Not enough data');
+    const lo = Math.floor(Math.min(...arr) / step) * step, hi = Math.ceil(Math.max(...arr) / step) * step || step, nb = Math.max(1, Math.round((hi - lo) / step));
+    const bins = new Array(nb).fill(0); arr.forEach(v => { bins[Math.min(nb - 1, Math.floor((v - lo) / step))]++; });
+    const centers = bins.map((_, i) => lo + (i + .5) * step);
+    barChart(id, 180, bins, centers.map(c => fmt(c)), { colors: centers.map(c => c >= 0 ? '#22c55e' : '#ef4444'), fmt: v => String(Math.round(v)), tipLabel: i => `${fmt(lo + i * step)} → ${fmt(lo + (i + 1) * step)}\n${bins[i]} trades` });
+  };
+  hist(rr, 0.5, 'cR', v => (v >= 0 ? '+' : '') + v.toFixed(1) + 'R');
+  const pn = rows.map(t => t.pnl), span = Math.max(...pn.map(Math.abs), 1), step = niceTicks(0, span, 6)[1] || 500;
+  hist(pn, step, 'cPnl', v => short(v));
+}
+function renderStreaks(rows, st) {
+  if (st.n < 3) { $('streaks').innerHTML = '<div class="empty">Need more trades</div>'; return; }
+  let cur = 0, type = '', mw = 0, ml = 0, w = 0, l = 0;
+  rows.forEach(t => { if (t.pnl > 0) { w++; l = 0; mw = Math.max(mw, w); } else if (t.pnl < 0) { l++; w = 0; ml = Math.max(ml, l); } else { w = l = 0; } });
+  const lastT = rows[rows.length - 1]; type = lastT.pnl > 0 ? 'W' : lastT.pnl < 0 ? 'L' : 'F';
+  for (let i = rows.length - 1; i >= 0; i--) { const tt = rows[i].pnl > 0 ? 'W' : rows[i].pnl < 0 ? 'L' : 'F'; if (tt === type) cur++; else break; }
+  const pl = st.losses / st.n, fk = st.kelly / 100;
+  $('streaks').innerHTML = `
+    <div class="kv"><span>Current streak</span><b class="${type === 'W' ? 'pos' : type === 'L' ? 'neg' : ''}">${cur}${type}</b></div>
+    <div class="kv"><span>Longest win / loss streak</span><b><span class="pos">${mw}W</span> / <span class="neg">${ml}L</span></b></div>
+    <div class="kv"><span>P(5 losses in a row, next 20)</span><b>${pct(pRun(20, 5, pl) * 100, 0)}</b></div>
+    <div class="kv"><span>P(3 losses in a row, next 10)</span><b>${pct(pRun(10, 3, pl) * 100, 0)}</b></div>
+    <div class="kv"><span>Std dev per trade</span><b>${inr(st.sd)}</b></div>
+    <div class="kv"><span>Worst single loss</span><b class="neg">${inr(st.worst.pnl)}</b></div>
+    <div class="kv"><span>Best single win</span><b class="pos">${inr(st.best.pnl)}</b></div>
+    <div class="kv"><span>Half-Kelly risk / trade</span><b class="blue">${fk > 0 ? pct(fk * 50, 1) + ' of capital' : 'no edge → 0%'}</b></div>
+    <div class="note">Sizing rule of thumb: never risk more per trade than what keeps the longest plausible loss streak (${Math.max(ml, 5)} trades) under your pain limit — e.g. 1% risk → ~${Math.max(ml, 5)}% drawdown.</div>`;
+}
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function renderMC() {
+  const pn = F.map(t => t.pnl);
+  if (pn.length < 10) { emptyChart('cMC', 260, 'Need ≥10 closed trades for a Monte-Carlo run'); $('mcStats').innerHTML = ''; return; }
+  const cap = Math.max(1, +$('mcCap').value || 100000), H = Math.min(500, Math.max(10, +$('mcH').value || 100)), ruinPct = Math.max(1, +$('mcRuin').value || 30), sims = 2000;
+  const rnd = mulberry32(pn.length * 7919 + Math.round(mean(pn))), paths = new Float32Array(sims * H), ruinAt = -cap * ruinPct / 100;
+  let ruin = 0, pos = 0; const mdds = [], fin = [];
+  for (let s = 0; s < sims; s++) { let eq = 0, pk = 0, mdd = 0, r = false; for (let h = 0; h < H; h++) { eq += pn[(rnd() * pn.length) | 0]; paths[s * H + h] = eq; if (eq > pk) pk = eq; if (eq - pk < mdd) mdd = eq - pk; if (!r && eq <= ruinAt) r = true; } if (r) ruin++; if (eq > 0) pos++; mdds.push(mdd); fin.push(eq); }
+  const q = (a, p) => { const b = [...a].sort((x, y) => x - y); return b[Math.min(b.length - 1, Math.floor(p * b.length))]; };
+  const P = [.05, .25, .5, .75, .95].map(() => new Array(H)), col = new Float32Array(sims);
+  for (let h = 0; h < H; h++) { for (let s = 0; s < sims; s++) col[s] = paths[s * H + h]; const sorted = Float32Array.from(col).sort(); [.05, .25, .5, .75, .95].forEach((p, i) => P[i][h] = sorted[Math.floor(p * (sims - 1))]); }
+  lineChart('cMC', 260, { series: [{ y: P[2], color: '#60a5fa', width: 2, name: 'Median' }], bands: [{ lo: P[0], hi: P[4], color: 'rgba(59,130,246,.10)' }, { lo: P[1], hi: P[3], color: 'rgba(59,130,246,.20)' }], labels: P[2].map((_, i) => 'trade ' + (i + 1)), fmt: inr, zero: true });
+  $('mcStats').innerHTML = `
+    <div class="kv"><span>Simulations</span><b>${sims.toLocaleString()} × ${H} trades</b></div>
+    <div class="kv"><span>P(profitable after ${H})</span><b class="${pos / sims >= .6 ? 'pos' : 'gold'}">${pct(pos / sims * 100, 0)}</b></div>
+    <div class="kv"><span>Median outcome</span><b class="${cls(q(fin, .5))}">${inrs(q(fin, .5))}</b></div>
+    <div class="kv"><span>5th pct (bad luck)</span><b class="neg">${inrs(q(fin, .05))}</b></div>
+    <div class="kv"><span>95th pct (good luck)</span><b class="pos">${inrs(q(fin, .95))}</b></div>
+    <div class="kv"><span>Median worst drawdown</span><b class="neg">${inr(q(mdds, .5))} (${pct(Math.abs(q(mdds, .5)) / cap * 100, 0)})</b></div>
+    <div class="kv"><span>95th-pct worst drawdown</span><b class="neg">${inr(q(mdds, .05))} (${pct(Math.abs(q(mdds, .05)) / cap * 100, 0)})</b></div>
+    <div class="kv"><span>P(hit −${ruinPct}% of ₹${cap.toLocaleString('en-IN')})</span><b class="${ruin / sims > .05 ? 'neg' : 'pos'}">${pct(ruin / sims * 100, 1)}</b></div>
+    <div class="note">Bootstrap: draws your own past trade results at random, assuming future trades look like past ones and are independent. It ignores regime shifts and sizing changes — read it as a stress test, not a forecast. Band = 5–95%, dark = 25–75%.</div>`;
+}
+
+/* ---- exits ---- */
+function renderExits(rows, st) {
+  const g = groupBy(rows, t => t.exitClass).map(x => ({ ...x, share: rows.length ? x.n / rows.length * 100 : 0 }));
+  sortableTable('exitTable', [{ k: 'key', label: 'Exit' }, { k: 'n', label: 'Trades' }, { k: 'share', label: 'Share', fmt: v => pct(v, 0) }, { k: 'net', label: 'Net ₹', fmt: inrs, color: cls, bar: true }, { k: 'exp', label: 'Avg ₹', fmt: inrs, color: cls }, { k: 'avgR', label: 'Avg R', fmt: v => v == null ? '—' : v.toFixed(2) }], g, { sort: 'net', dir: -1 });
+  const wm = rows.filter(t => t.pnl > 0 && t.mfe > 0 && t.pts != null);
+  let ex = '';
+  if (wm.length >= 3) { const cap = mean(wm.map(t => t.pts / t.mfe)) * 100; ex += `<div class="kv"><span>Peak capture on winners (${wm.length})</span><b class="${cap >= 60 ? 'pos' : 'gold'}">${pct(cap, 0)}</b></div><div class="note">Exit pts ÷ peak pts. Low capture means you give back open profit — tighter trails or earlier partials may help.</div>`; }
+  const mb = rows.filter(t => t.moonbag); if (mb.length) { const m = calc(mb); ex += `<div class="kv"><span>Moonbag trades</span><b>${mb.length} · ${inrs(m.net)} · avg ${inrs(m.exp)}</b></div>`; }
+  $('exitExtra').innerHTML = ex || '<div class="note">Peak/MFE data is not stored for these trades, so profit give-back can’t be measured yet.</div>';
+
+  const hb = t => t.hold == null ? null : t.hold < 5 ? '< 5 min' : t.hold < 15 ? '5–15 min' : t.hold < 30 ? '15–30 min' : t.hold < 60 ? '30–60 min' : t.hold < 120 ? '1–2 h' : '> 2 h';
+  const order = ['< 5 min', '5–15 min', '15–30 min', '30–60 min', '1–2 h', '> 2 h'];
+  const hg = groupBy(rows, hb).map(x => ({ ...x, ord: order.indexOf(x.key) }));
+  sortableTable('holdTable', [{ k: 'key', label: 'Hold time' }, { k: 'n', label: 'Trades' }, { k: 'wr', label: 'Win %', fmt: v => pct(v, 0) }, { k: 'net', label: 'Net ₹', fmt: inrs, color: cls, bar: true }, { k: 'exp', label: 'Avg ₹', fmt: inrs, color: cls }], hg, { sort: 'key', dir: 1 });
+  // target funnel from recorded (non-planned) ladders only
+  const f = {}; rows.forEach(t => t.targets.filter(x => !x.planned && x.hit_known !== false).forEach(x => { const k = x.name; f[k] = f[k] || { hit: 0, n: 0 }; f[k].n++; if (x.hit) f[k].hit++; }));
+  const ks = Object.keys(f).sort();
+  $('targetFunnel').innerHTML = ks.length ? '<div class="breakdown" style="font-size:9px;color:var(--text2);letter-spacing:.12em;margin-bottom:6px">TARGET LADDER HIT-RATE (recorded data only)</div>' + ks.map(k => `<div class="row2" style="grid-template-columns:90px 1fr 80px"><span>${esc(k)}</span><div class="meter"><b style="width:${f[k].hit / f[k].n * 100}%;background:var(--accent)"></b></div><span style="text-align:right">${f[k].hit}/${f[k].n} · ${pct(f[k].hit / f[k].n * 100, 0)}</span></div>`).join('') : '<div class="note">No recorded target ladders yet — the engine hasn’t persisted per-target hit state for these trades, so a T1→T2→T3 funnel can’t be built.</div>';
+}
+function renderTop(rows) {
+  const cols = [{ k: 'date', label: 'Date' }, { k: 'index', label: 'Index' }, { k: 'type', label: 'Type' }, { k: 'dir', label: 'Dir' }, { k: 'pts', label: 'Pts', fmt: v => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(1), color: cls }, { k: 'pnl', label: '₹', fmt: inrs, color: cls }, { k: 'r', label: 'R', fmt: v => v == null ? '—' : v.toFixed(2) }, { k: 'exitClass', label: 'Exit' }];
+  const s = [...rows].sort((a, b) => b.pnl - a.pnl);
+  sortableTable('topW', cols, s.slice(0, 5), { sort: 'pnl', dir: -1 });
+  sortableTable('topL', cols, s.slice(-5).reverse(), { sort: 'pnl', dir: 1 });
+}
+function renderDQ(rows) {
+  const n = rows.length; if (!n) { $('dq').innerHTML = '<div class="empty">No data</div>'; return; }
+  const c = fn => rows.filter(fn).length, bar = (label, v, note) => `<div class="row2" style="grid-template-columns:230px 1fr 90px"><span>${label}</span><div class="meter"><b style="width:${v / n * 100}%;background:${v / n > .8 ? 'var(--green)' : v / n > .4 ? 'var(--gold)' : 'var(--red)'}"></b></div><span style="text-align:right">${v}/${n} · ${pct(v / n * 100, 0)}</span></div>${note ? `<div class="note" style="margin:-2px 0 6px">${note}</div>` : ''}`;
+  $('dq').innerHTML = [
+    bar('Engine state row found', c(t => t.stateFound), 'Rows missing here have no persisted target/SL/moonbag state (engine_signal_states), so the dashboard can only show planned or derived values.'),
+    bar('Quantity recorded (not derived)', c(t => t.qty > 0 && !t.derived.includes('quantity'))),
+    bar('Real target ladder stored', c(t => t.targets.some(x => !x.planned)), 'Needed for T1/T2/T3 hit-rate and moonbag analytics.'),
+    bar('Peak premium stored', c(t => t.peak > 0), 'Needed for give-back / peak-capture analysis. Persisting the running peak in engine_signal_states unlocks it.'),
+    bar('Stop-loss recorded (not derived)', c(t => t.slPrice > 0 && !t.derived.includes('sl_price'))),
+    bar('R-multiple computable', c(t => t.r != null)),
+    bar('Conviction probability present', c(t => t.prob != null)),
+    bar('Regime tagged', c(t => t.regime !== 'UNKNOWN')),
+    bar('Hold-time computable (entry+exit times)', c(t => t.hold != null))
+  ].join('');
+}
+
+/* ═══════════════ orchestration ═══════════════ */
+function renderAll() {
+  applyFilters();
+  const st = calc(F);
+  renderKPIs(st); renderConfidence(st); renderInsights(F, st);
+  renderEquity(F); renderDaily(F, st); renderRolling(F); renderCalendar(F); renderHeat(F);
+  renderBreakdown(); renderConviction(F); renderDistributions(F, st); renderStreaks(F, st); renderMC();
+  renderExits(F, st); renderTop(F); renderDQ(F);
+}
+async function load() {
+  try {
+    const r = await fetch('/api/trades');
+    if (r.status === 401) { location.href = '/login'; return; }
+    const d = await r.json();
+    ALL = (d.signals || []).filter(s => String(s.status).toLowerCase() === 'closed' && (s.pnl_inr != null || s.rupee_pnl != null)).map(normTrade).filter(Boolean);
+    ALL.sort((a, b) => a.tm - b.tm);
+    fillSelect('fIndex', ALL.map(t => t.index)); fillSelect('fType', ALL.map(t => t.type)); fillSelect('fChan', ALL.map(t => t.channel));
+    $('updated').textContent = 'updated ' + new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST · ' + ALL.length + ' closed trades';
+    renderAll();
+  } catch (e) { console.warn(e); $('updated').textContent = 'load failed — retrying'; }
+}
+bindFilters(); load();
+setInterval(load, 60000);
+let rz; addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(renderAll, 200); });
+</script>
+</body>
+</html>

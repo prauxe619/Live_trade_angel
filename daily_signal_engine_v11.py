@@ -3172,7 +3172,7 @@ class Fmt:
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️ <b>Market is in CHOP — directional trades risky.</b>\n"
             f"<b>Today's strategy: Iron Condor (sell time decay)</b>\n\n"
-            f"💳 <b>Spot : {spot:.1f} | ATM {s['atm']}</b>\n"
+            f"💳 <b>Spot : {spot:.1f} | ATM {s.get('atm', 'N/A')}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📤 <b>SELL {s['short_call']} CE</b>\n"
             f"📥 <b>BUY  {s['long_call']} CE</b>\n"
