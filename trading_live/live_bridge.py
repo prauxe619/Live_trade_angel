@@ -48,6 +48,14 @@ class LiveConfig:
         self.flatten_hhmm = os.getenv("HARD_FLATTEN_HHMM", "15:26")
         self.supervise_every_s = _f("SUPERVISE_EVERY_S", 15)
         self.product = "INTRADAY"
+        
+        self.quote_max_age_s = {
+            "NIFTY": _f("NIFTY_MAX_QUOTE_AGE_S", 120.0),
+            "BANKNIFTY": _f("BANKNIFTY_MAX_QUOTE_AGE_S", 120.0),
+            "FINNIFTY": _f("FINNIFTY_MAX_QUOTE_AGE_S", 120.0),
+            "SENSEX": _f("SENSEX_MAX_QUOTE_AGE_S", 120.0),
+        }
+
 
 
 def _tag(signal_id: str) -> str:
@@ -490,10 +498,21 @@ class LiveBridge:
                     )
 
                 # Fetch a new execution price from Angel One.
+                
+                index_key = str(sig["index"]).strip().upper()
+                
+                max_quote_age_s = self.cfg.quote_max_age_s.get(index_key)
+                
+                if max_quote_age_s is None or max_quote_age_s <= 0:
+                    raise BrokerSafetyError(
+                        f"Missing or invalid live quote age configuration: {index_key}"
+                    )
+                
                 quote = self.broker.market_quote(
                     contract,
-                    max_age_s=self.cfg.max_quote_age_s,
+                    max_age_s=max_quote_age_s,
                 )
+
 
                 ltp = float(quote.get("ltp", 0))
                 response_received = float(
