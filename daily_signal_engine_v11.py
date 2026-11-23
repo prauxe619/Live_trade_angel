@@ -152,8 +152,9 @@ TRADING_TELEGRAM_CHAT_ID = TELEGRAM_CHAT_ID
 VIP_CHANNEL_ID = TELEGRAM_CHAT_ID
 
 # Compatibility aliases: the legacy single-chat name now means the channel only.
-TRADING_TELEGRAM_CHAT_ID = _LIVE_BOT_CHANNEL_ID
-VIP_CHANNEL_ID = _LIVE_BOT_CHANNEL_ID
+# Compatibility aliases: the legacy single-chat name now means the channel only.
+TRADING_TELEGRAM_CHAT_ID = TELEGRAM_CHAT_ID
+VIP_CHANNEL_ID = TELEGRAM_CHAT_ID
 
 PAYMENT_LINKS = {
     "trial"  : os.getenv("PAYMENT_LINK_TRIAL",   "https://cosmofeed.com/vig/69e4b42c9e4e440013c2b4dd"),
