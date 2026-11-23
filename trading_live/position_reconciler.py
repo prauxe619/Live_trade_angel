@@ -12,7 +12,7 @@ All ambiguous or incomplete states fail closed.
 """
 
 from __future__ import annotations
-
+import math
 from dataclasses import dataclass, asdict
 from hashlib import sha256
 from math import isfinite
