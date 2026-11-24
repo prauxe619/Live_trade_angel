@@ -64,7 +64,7 @@ class FakeBroker:
             raise BrokerSafetyError("position endpoint unavailable")
         return self.positions
 
-    def orders(self):
+    def orders(self, force_refresh=False):
         if self.fail_orders:
             raise BrokerSafetyError("order endpoint unavailable")
         return self.order_rows

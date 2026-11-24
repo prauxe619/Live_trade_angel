@@ -674,15 +674,25 @@ def get_recent_futures_candles(
         token, expiry = contract
         rows = conn.execute(
             """
-            SELECT ts, volume, source, tick_count, is_complete, quality_status
+            SELECT
+                ts,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                source,
+                tick_count,
+                is_complete,
+                quality_status
             FROM market_futures_ohlcv_candles
             WHERE symbol = %s
-              AND token = %s
-              AND expiry = %s
-              AND trade_date = %s
-              AND is_complete IS TRUE
-              AND UPPER(quality_status) = 'VALID'
-              AND tick_count >= 3
+            AND token = %s
+            AND expiry = %s
+            AND trade_date = %s
+            AND is_complete IS TRUE
+            AND UPPER(quality_status) = 'VALID'
+            AND tick_count >= 3
             ORDER BY ts DESC
             LIMIT %s
             """,
@@ -708,7 +718,18 @@ def get_recent_futures_candles(
 
     now_utc = datetime.now(timezone.utc)
     result = []
-    for ts, volume, source, tick_count, is_complete, quality_status in reversed(rows):
+    for (
+        ts,
+        open_price,
+        high_price,
+        low_price,
+        close_price,
+        volume,
+        source,
+        tick_count,
+        is_complete,
+        quality_status,
+    ) in reversed(rows):
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         volume = float(volume)
@@ -717,14 +738,25 @@ def get_recent_futures_candles(
         ts_utc = ts.astimezone(timezone.utc)
         result.append({
             "timestamp": ts_utc.astimezone(IST).isoformat(),
+
+            "open": float(open_price),
+            "high": float(high_price),
+            "low": float(low_price),
+            "close": float(close_price),
+
             "volume": volume,
             "source": str(source or ""),
             "tick_count": int(tick_count or 0),
             "is_complete": bool(is_complete),
             "quality_status": str(quality_status or "").upper(),
+
             "token": str(token),
             "expiry": expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry),
-            "age_seconds": max(0.0, (now_utc - ts_utc).total_seconds()),
+
+            "age_seconds": max(
+                0.0,
+                (now_utc - ts_utc).total_seconds()
+            ),
         })
     return result
 

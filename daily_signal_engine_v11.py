@@ -89,6 +89,387 @@ IST = ZoneInfo("Asia/Kolkata")
 def _ist_now() -> datetime:
     return datetime.now(IST)
 
+def _calculate_futures_session_vwap(futures_rows):
+    """
+    Shadow-only conventional session VWAP.
+
+    Uses:
+        Typical Price = (High + Low + Close) / 3
+
+        Session VWAP =
+            Sum(Typical Price * Volume) / Sum(Volume)
+
+    Only current-session, completed, valid futures candles.
+    """
+
+    result = {
+        "valid": False,
+        "reason": "missing_futures_data",
+        "vwap": None,
+        "distance": None,
+        "direction": None,
+        "latest_close": None,
+        "latest_timestamp": None,
+        "token": None,
+        "expiry": None,
+        "bar_count": 0,
+        "volume_sum": 0.0,
+        "coverage_pct": 0.0,
+        "valid_bar_count": 0,
+        "positive_volume_bar_count": 0,
+    }
+
+    try:
+        if not futures_rows:
+            return result
+
+        df = pd.DataFrame(futures_rows)
+
+        required = [
+            "timestamp", "open", "high", "low", "close",
+            "volume", "tick_count", "is_complete", "quality_status"
+        ]
+
+        if not all(col in df.columns for col in required):
+            result["reason"] = "missing_required_columns"
+            return result
+
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"], errors="coerce", utc=True
+        )
+
+        for col in ["open", "high", "low", "close", "volume", "tick_count"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df = df.dropna(subset=required[:7])
+
+        df = df[
+            (df["open"] > 0)
+            & (df["high"] > 0)
+            & (df["low"] > 0)
+            & (df["close"] > 0)
+            & (df["volume"] >= 0)
+            & (df["tick_count"] >= 3)
+            & (df["high"] >= df[["open", "low", "close"]].max(axis=1))
+            & (df["low"] <= df[["open", "high", "close"]].min(axis=1))
+            & df["is_complete"].eq(True)
+            & df["quality_status"].astype(str).str.upper().eq("VALID")
+        ].copy()
+
+        if df.empty:
+            result["reason"] = "no_valid_completed_candles"
+            return result
+
+        df = df.sort_values("timestamp")
+        df = df.drop_duplicates("timestamp", keep="last")
+
+        df["timestamp_ist"] = df["timestamp"].dt.tz_convert(IST)
+
+        now_ist = _ist_now()
+        session_date = now_ist.date()
+
+        # Current trading session only.
+        session_minutes = (
+            df["timestamp_ist"].dt.hour * 60
+            + df["timestamp_ist"].dt.minute
+        )
+
+        df = df[
+            (df["timestamp_ist"].dt.date == session_date)
+            & (session_minutes >= 9 * 60 + 15)
+            & (df["timestamp_ist"] <= now_ist)
+        ].copy()
+
+        if df.empty:
+            result["reason"] = "no_current_session_candles"
+            return result
+
+        latest = df.iloc[-1]
+
+        latest_ts = latest["timestamp"]
+        latest_age = (
+            pd.Timestamp.now(tz="UTC") - latest_ts
+        ).total_seconds()
+
+        max_age = max(
+            30.0,
+            float(os.getenv("CANDLE_MAX_AGE_SECONDS", "180"))
+        )
+
+        if latest_age < -5 or latest_age > max_age:
+            result["reason"] = "stale_futures_candles"
+            return result
+
+        # Session history should begin close to the exchange open.
+        first_time = df.iloc[0]["timestamp_ist"]
+
+        if first_time.hour * 60 + first_time.minute > 9 * 60 + 20:
+            result["reason"] = "incomplete_session_history"
+            return result
+
+        # Only positive traded volume contributes to VWAP.
+        # Only positive-volume candles contribute to the VWAP calculation.
+        weighted = df[df["volume"] > 0].copy()
+
+        if len(weighted) < 20:
+            result["reason"] = "insufficient_valid_volume_bars"
+            return result
+
+        # Keep the existing expected_bars calculation here.
+        # It must be defined before the coverage calculation.
+
+        valid_bar_count = len(df)
+        expected_bars = max(
+            1,
+            int(
+                (
+                    latest["timestamp_ist"]
+                    - pd.Timestamp(
+                        now_ist.replace(
+                            hour=9, minute=15, second=0, microsecond=0
+                        )
+                    )
+                ).total_seconds() / 60
+            ) + 1
+        )
+
+        valid_bar_count = len(df)
+        positive_volume_bar_count = len(weighted)
+        coverage = min(1.0, valid_bar_count / expected_bars)
+
+        if coverage < 0.80:
+            result["reason"] = "insufficient_session_coverage"
+            return result
+
+        typical_price = (
+            weighted["high"]
+            + weighted["low"]
+            + weighted["close"]
+        ) / 3.0
+
+        volume_sum = float(weighted["volume"].sum())
+
+        if not math.isfinite(volume_sum) or volume_sum <= 0:
+            result["reason"] = "invalid_total_volume"
+            return result
+
+        session_vwap = float(
+            (typical_price * weighted["volume"]).sum() / volume_sum
+        )
+
+        latest_close = float(latest["close"])
+        distance = latest_close - session_vwap
+
+        if not math.isfinite(session_vwap) or session_vwap <= 0:
+            result["reason"] = "invalid_session_vwap"
+            return result
+
+        result.update({
+            "valid": True,
+            "reason": "valid",
+            "vwap": session_vwap,
+            "distance": distance,
+            "direction": "BULLISH" if distance > 0 else "BEARISH",
+            "latest_close": latest_close,
+            "latest_timestamp": latest_ts.isoformat(),
+            "token": str(latest.get("token", "")),
+            "expiry": str(latest.get("expiry", "")),
+            "bar_count": valid_bar_count,
+            "valid_bar_count": valid_bar_count,
+            "positive_volume_bar_count": positive_volume_bar_count,
+            "volume_sum": volume_sum,
+            "coverage_pct": round(coverage * 100, 2),
+        })
+
+        return result
+
+    except Exception as exc:
+        _log.exception("[VWAP SHADOW] Calculation failed: %s", exc)
+        result["reason"] = "calculation_exception"
+        return result
+
+
+def _persist_vwap_shadow_observation(
+    symbol: str,
+    candles: pd.DataFrame,
+    snap: dict,
+    rolling_vwap: float,
+    rolling_distance: float,
+    live_probability: float,
+    live_signal: str,
+    shadow_probability,
+    shadow_signal: str,
+    shadow: dict,
+) -> None:
+    """
+    Persist one rolling-VWAP vs futures-session-VWAP observation.
+
+    Uses the existing shared PostgreSQL connection.
+    Persistence failures must never change trading decisions.
+    """
+
+    def _num(value):
+        try:
+            value = float(value)
+            return value if math.isfinite(value) else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    try:
+        observed_at = _ist_now()
+
+        # Latest spot candle timestamp.
+        candle_ts = None
+        if (
+            isinstance(candles, pd.DataFrame)
+            and not candles.empty
+            and "timestamp" in candles.columns
+        ):
+            parsed_ts = pd.to_datetime(
+                candles["timestamp"].iloc[-1],
+                errors="coerce",
+                utc=True,
+            )
+            if not pd.isna(parsed_ts):
+                candle_ts = parsed_ts.to_pydatetime()
+
+        # Existing rolling VWAP direction.
+        rolling_direction = (
+            "BULLISH" if rolling_distance > 0 else "BEARISH"
+        )
+
+        shadow_valid = bool(shadow.get("valid"))
+
+        session_direction = shadow.get("direction")
+
+        agreement = (
+            rolling_direction == session_direction
+            if shadow_valid and session_direction
+            else None
+        )
+
+        session_vwap = _num(shadow.get("vwap"))
+        session_distance = _num(shadow.get("distance"))
+        futures_latest_close = _num(shadow.get("latest_close"))
+
+        spot_price = _num(snap.get("spot"))
+
+        # Important: retain both futures-based and spot-based distances.
+        # Futures VWAP and spot index prices have a basis difference.
+        session_spot_distance = (
+            spot_price - session_vwap
+            if spot_price is not None and session_vwap is not None
+            else None
+        )
+
+        futures_latest_timestamp = None
+        raw_futures_ts = shadow.get("latest_timestamp")
+
+        if raw_futures_ts:
+            parsed_futures_ts = pd.to_datetime(
+                raw_futures_ts,
+                errors="coerce",
+                utc=True,
+            )
+            if not pd.isna(parsed_futures_ts):
+                futures_latest_timestamp = (
+                    parsed_futures_ts.to_pydatetime()
+                )
+
+        with _shared_db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO vwap_shadow_observations (
+                        observed_at,
+                        session_date,
+                        symbol,
+                        spot_price,
+                        spot_candle_timestamp,
+                        rolling_vwap,
+                        rolling_distance,
+                        rolling_direction,
+                        session_vwap,
+                        session_distance,
+                        session_direction,
+                        session_spot_distance,
+                        futures_latest_close,
+                        futures_latest_timestamp,
+                        futures_token,
+                        futures_expiry,
+                        futures_volume_sum,
+                        futures_valid_bars,
+                        futures_positive_volume_bars,
+                        futures_coverage_pct,
+                        shadow_valid,
+                        shadow_reason,
+                        vwap_agreement,
+                        live_probability,
+                        shadow_probability,
+                        live_signal,
+                        shadow_signal,
+                        india_vix
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        observed_at,
+                        observed_at.date(),
+                        symbol,
+                        spot_price,
+                        candle_ts,
+                        _num(rolling_vwap),
+                        _num(rolling_distance),
+                        rolling_direction,
+                        session_vwap,
+                        session_distance,
+                        session_direction,
+                        _num(session_spot_distance),
+                        futures_latest_close,
+                        futures_latest_timestamp,
+                        shadow.get("token"),
+                        shadow.get("expiry"),
+                        _num(shadow.get("volume_sum")),
+                        shadow.get("valid_bar_count"),
+                        shadow.get("positive_volume_bar_count"),
+                        _num(shadow.get("coverage_pct")),
+                        shadow_valid,
+                        shadow.get("reason"),
+                        agreement,
+                        _num(live_probability),
+                        _num(shadow_probability),
+                        live_signal,
+                        shadow_signal,
+                        _num(snap.get("vix")),
+                    ),
+                )
+
+        _log.info(
+            "[VWAP SHADOW DB SAVED] %s | valid=%s | "
+            "agreement=%s | live=%.4f | shadow=%s",
+            symbol,
+            shadow_valid,
+            agreement,
+            float(live_probability),
+            (
+                f"{float(shadow_probability):.4f}"
+                if shadow_probability is not None
+                else "UNAVAILABLE"
+            ),
+        )
+
+    except Exception:
+        # Historical analytics must never interrupt the signal engine.
+        _log.exception(
+            "[VWAP SHADOW DB SAVE FAILED] %s",
+            symbol,
+        )
+
 
 # Number of exchange lots per strategy trade. cfg["lot"] below is the
 # contract units in one lot; it is NOT the number of lots. Start with 1.
@@ -223,6 +604,7 @@ STRONG_BK_RETEST_ATR = 0.20
 STRONG_BK_RETEST_MAX_AGE_SEC = 900
 STRONG_BK_CONFIRM_BODY_RATIO = 0.45
 STRONG_BK_MIN_ATR_PCT = 0.0005
+STRONG_BK_MIN_BREAKOUT_ATR = 0.15
 
 def _vix_sl_multiplier(vix: float) -> float:
     """Return SL/TP scaling factor based on India VIX."""
@@ -1392,6 +1774,13 @@ class SignalDataFetcher:
                     index_key
                 )
                 return pd.DataFrame()
+            # Initialize shadow VWAP metadata.
+            # Invalid by default: shadow must never use incomplete futures data.
+            candles.attrs["session_vwap_shadow"] = {
+                "valid": False,
+                "reason": "futures_data_not_loaded",
+            }
+            candles.attrs["index_key"] = index_key
 
             # Spot index OHLC has no traded volume. Keep its volume field
             # untouched and attach genuine futures volume in a separate column.
@@ -1404,7 +1793,7 @@ class SignalDataFetcher:
 
                 futures_rows = get_recent_futures_candles(
                     index_key,
-                    limit=240,
+                    limit=1000,
                     max_age_seconds=max(
                         30.0, float(os.getenv("CANDLE_MAX_AGE_SECONDS", "180"))
                     ),
@@ -1451,10 +1840,42 @@ class SignalDataFetcher:
                         "strong-breakout volume confirmation will fail closed",
                         index_key,
                     )
+
+                # Independent session VWAP calculation.
+                # This does not modify existing index candles or volume.
+                session_vwap_shadow = _calculate_futures_session_vwap(
+                    futures_rows
+                )
+
+                candles.attrs["session_vwap_shadow"] = session_vwap_shadow
+                candles.attrs["index_key"] = index_key
+
+                _log.info(
+                    "[VWAP SHADOW DATA] %s | valid=%s | reason=%s | "
+                    "session_vwap=%s | distance=%s | direction=%s | "
+                    "bars=%s | coverage=%s%%",
+                    index_key,
+                    session_vwap_shadow["valid"],
+                    session_vwap_shadow["reason"],
+                    session_vwap_shadow["vwap"],
+                    session_vwap_shadow["distance"],
+                    session_vwap_shadow["direction"],
+                    session_vwap_shadow["bar_count"],
+                    session_vwap_shadow["coverage_pct"],
+                )
             except Exception as futures_exc:
+                candles.attrs["session_vwap_shadow"] = {
+                    "valid": False,
+                    "reason": "futures_data_error",
+                    "error": str(futures_exc),
+                }
+                candles.attrs["index_key"] = index_key
+
                 _log.warning(
-                    "%s: futures-volume read/join failed; breakout volume unavailable: %s",
-                    index_key, futures_exc,
+                    "%s: futures-volume read/join failed; "
+                    "breakout volume/VWAP unavailable: %s",
+                    index_key,
+                    futures_exc,
                 )
 
             _log.info(
@@ -2082,6 +2503,7 @@ class TechnicalBrain:
         _vol_s = vol.iloc[-_session_len:]
         vwap      = (_c_s * _vol_s).cumsum() / _vol_s.cumsum()
         vwap_dist = float((_c_s - vwap).iloc[-1])
+        rolling_vwap = float(vwap.iloc[-1])
 
         ma5  = float(c.rolling(5).mean().iloc[-1])
         ma20 = float(c.rolling(20).mean().iloc[-1])
@@ -2130,8 +2552,72 @@ class TechnicalBrain:
         else:
             _log.warning(f"Institutional data (PCR/GEX) > 5m old ({age_s:.0f}s). Skipping weighting.")
 
-        if vix > 20: score *= 0.75
-        if vix > 28: score *= 0.60
+        # -------------------------------------------------
+        # SHADOW SESSION VWAP
+        # Does NOT affect existing live probability.
+        # -------------------------------------------------
+
+        vwap_shadow = candles.attrs.get(
+            "session_vwap_shadow", {}
+        )
+
+        shadow_valid = bool(vwap_shadow.get("valid"))
+
+        old_vwap_component = (
+            0.2 if vwap_dist > 0 else -0.2
+        )
+
+        shadow_probability = None
+        shadow_signal = "UNAVAILABLE"
+        shadow_score = None
+
+        if shadow_valid:
+
+            session_distance = float(vwap_shadow["distance"])
+
+            new_vwap_component = (
+                0.2 if session_distance > 0 else -0.2
+            )
+
+            # Replace the existing VWAP contribution hypothetically.
+            # Never add both VWAP contributions.
+            shadow_score = (
+                score
+                - old_vwap_component
+                + new_vwap_component
+            )
+
+        if vix > 20:
+            score *= 0.75
+
+            if shadow_score is not None:
+                shadow_score *= 0.75
+
+        if vix > 28:
+            score *= 0.60
+
+            if shadow_score is not None:
+                shadow_score *= 0.60
+
+        if shadow_score is not None:
+
+            shadow_probability = float(
+                np.clip(shadow_score / 1.6, -1.0, 1.0)
+            )
+
+            shadow_is_chop = (
+                bb_w < 0.015
+                and abs(shadow_probability) < CHOP_PROB_CEILING
+            )
+
+            if shadow_is_chop:
+                shadow_signal = "CHOP"
+            elif abs(shadow_probability) >= SNIPER_MIN_PROB:
+                shadow_signal = "SNIPER"
+            elif abs(shadow_probability) >= SCALP_MIN_PROB:
+                shadow_signal = "SCALP"
+            else:
+                shadow_signal = "HOLD"
 
         # Divisor = dominant indicator max (MACD 0.6 + MA 0.5 + RSI 0.3) = 1.4, rounded to 1.6
         # for headroom. Scores above 1.6 clip to 1.0 (extreme confluence = max conviction).
@@ -2190,9 +2676,72 @@ class TechnicalBrain:
                 "pcr"      : round(pcr, 2),
                 "vix"      : round(vix, 1),
                 "is_chop"  : is_chop,
+            "vwap_shadow": {
+                "valid": shadow_valid,
+                "reason": vwap_shadow.get("reason"),
+                "rolling_vwap_direction": (
+                    "BULLISH" if vwap_dist > 0 else "BEARISH"
+                ),
+                "session_vwap": vwap_shadow.get("vwap"),
+                "session_vwap_distance": vwap_shadow.get("distance"),
+                "session_vwap_direction": vwap_shadow.get("direction"),
+                "agreement": (
+                    (
+                        "BULLISH" if vwap_dist > 0 else "BEARISH"
+                    ) == vwap_shadow.get("direction")
+                    if shadow_valid else None
+                ),
+                "shadow_probability": shadow_probability,
+                "shadow_signal": shadow_signal,
+            },
             },
         })
+        if shadow_valid:
+            _log.info(
+                "[VWAP SHADOW COMPARE] %s | "
+                "ROLLING=%s | SESSION=%s | "
+                "AGREEMENT=%s | LIVE_PROB=%.4f | "
+                "SHADOW_PROB=%.4f | LIVE_SIGNAL=%s | "
+                "SHADOW_SIGNAL=%s",
+                candles.attrs.get("index_key", "UNKNOWN"),
+                "BULLISH" if vwap_dist > 0 else "BEARISH",
+                vwap_shadow.get("direction"),
+                (
+                    ("BULLISH" if vwap_dist > 0 else "BEARISH")
+                    == vwap_shadow.get("direction")
+                ),
+                prob,
+                shadow_probability,
+                sig,
+                shadow_signal,
+            )
+        
+        else:
+            _log.info(
+                "[VWAP SHADOW INVALID] %s | reason=%s",
+                candles.attrs.get("index_key", "UNKNOWN"),
+                vwap_shadow.get("reason", "unavailable"),
+            )
+
+        # Persist the rolling/session VWAP comparison.
+        # This is analytics-only and cannot modify live probability.
+        _persist_vwap_shadow_observation(
+            symbol=str(
+                candles.attrs.get("index_key", "UNKNOWN")
+            ),
+            candles=candles,
+            snap=snap,
+            rolling_vwap=rolling_vwap,
+            rolling_distance=vwap_dist,
+            live_probability=prob,
+            live_signal=sig,
+            shadow_probability=shadow_probability,
+            shadow_signal=shadow_signal,
+            shadow=vwap_shadow,
+        )
+
         return result
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
