@@ -22,16 +22,35 @@ def live_management_requested() -> bool:
 
 
 def live_execution_requested() -> bool:
-    """Permission to consider a new live entry; the bridge enforces all order gates."""
+    """
+    Permission to consider a new live entry.
+
+    All required authorisation gates must be enabled.
+    The LiveBridge still performs its own independent safety checks.
+    """
     return (
-        os.getenv("TRADING_MODE", "paper").strip().lower() == "live"
-        and os.getenv("TRADING_ENABLED", "false").strip().lower() == "true"
+        os.getenv("TRADING_MODE", "live").strip().lower() == "live"
+        and os.getenv("LIVE_TRADING_ACK", "") == "I_UNDERSTAND_REAL_ORDERS"
+        and os.getenv("TRADING_ENABLED", "true").strip().lower() == "true"
+        and os.getenv("ALLOW_ORDER_SUBMISSION", "true").strip().lower() == "true"
     )
 
 
 def _bridge():
     from trading_live.live_bridge import get_bridge
-    return get_bridge()
+
+    bridge = get_bridge()
+
+    if (
+        os.getenv("TRADING_MODE", "paper").strip().lower() == "live"
+        and getattr(bridge.broker, "_auth_provider", None) is None
+    ):
+        raise RuntimeError(
+            "LIVE BROKER AUTHENTICATION PROVIDER NOT INITIALIZED; "
+            "blocking broker operation"
+        )
+
+    return bridge
 
 
 def submit_engine_entry(sig, fetcher, trade_lots=1):
