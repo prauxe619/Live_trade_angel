@@ -729,7 +729,7 @@ MOONBAG_PREMIUM_SL_STEP = {
     "BANKNIFTY": 60.0,
     "SENSEX": 70.0,
     "NIFTY": 25.0,
-    "FINNIFTY": 30.0,
+    "FINNIFTY": 25.0,
 }
 VIX_TOKEN = "26017"
 
@@ -792,7 +792,7 @@ def _afternoon_prob_threshold() -> float:
 
 # ── Intraday hard cutoffs ─────────────────────────────────────────────────────
 NO_NEW_SCALP_HM    = "13:30"   # scalp window closes (needs 2h to run)
-NO_NEW_SNIPER_HM   = "14:30"   # no new snipers after 2:30 PM
+NO_NEW_SNIPER_HM   = "14:35"   # no new snipers after 2:30 PM
 INTRADAY_CUTOFF_HM = "15:00"   # HARD BLOCK — NO new signals of any kind
 
 # ── Strategy thresholds ────────────────────────────────────────────────────────
@@ -812,18 +812,22 @@ LIVE_SNAPSHOT_MAX_AGE_S  = max(1, int(os.getenv("LIVE_SNAPSHOT_MAX_AGE_SECONDS",
 
 # ── Scan schedule (HH:MM IST) ─────────────────────────────────────────────────
 SCANS = {
-    "pre_market"  : "09:09",
-    "swing_close" : "09:25",
-    "scan_945"    : "09:45",
-    "scan_1030"   : "10:30",
-    "scan_1130"   : "11:30",
-    "scan_1230"   : "12:30",
-    "scan_1315"   : "13:15",
-    "scan_1400"   : "14:00",
-    "scan_1430"   : "14:30",
-    "pre_close"   : "14:45",
-    "force_close" : "15:25",
-    "eod"         : "15:30",
+    "pre_market":  "09:09",
+    "swing_close": "09:25",
+
+    # Prime Window 1: Opening Range Breakout & Morning Trend
+    "scan_935":    "09:35",   # Catches 15-min ORB (09:15-09:30) 10 mins earlier than 09:45
+    "scan_1005":   "10:05",   # Morning trend confirmation
+    "scan_1045":   "10:45",   # Trend continuation / VWAP bounce
+
+    # Prime Window 2: Afternoon Institutional Flow & 0DTE Gamma
+    "scan_1330":   "13:30",   # European overlap & afternoon volume return
+    "scan_1400":   "14:00",   # Primary afternoon breakout / 0DTE push
+    "scan_1430":   "14:30",   # Final high-conviction entry cutoff
+
+    "pre_close":   "14:45",
+    "force_close": "15:25",
+    "eod":         "15:30",
 }
 
 # ── v11: Isolated memory path (no conflicts with v8/v10) ──────────────────────
@@ -896,6 +900,35 @@ async def _async_tq_worker():
                 _log.error(f"TQ async worker: {e}")
             finally:
                 _tq.task_done()
+
+
+
+def _is_valid_entry_window(now_hm: str) -> bool:
+    """Matches your Prime Window 1 (09:35-10:45) and Prime Window 2 (13:30-14:30)."""
+    return ("09:30" <= now_hm <= "11:05") or ("13:30" <= now_hm <= "14:35")
+
+def _effective_prob_threshold(index_key: str, is_live: bool = False) -> float:
+    """
+    Applies time-of-day and live-scan conviction bumps on top of each index's base min_prob.
+      Morning   (09:30–13:29): base (NIFTY 0.60, FINNIFTY 0.62, BNF/SENSEX 0.68)
+      Afternoon (13:30–14:14): base + 0.03
+      Late day  (14:15–14:35): base + 0.07
+      Live 5-min ticks       : +0.03 stricter (floor at LIVE_SCAN_PROB_THRESHOLD)
+    """
+    base = float(INDICES.get(index_key, {}).get("min_prob", 0.60))
+    now_h = _ist_now().hour + _ist_now().minute / 60
+
+    if now_h >= 14.25:       # 14:15+
+        thresh = base + 0.07
+    elif now_h >= 13.50:     # 13:30–14:14
+        thresh = base + 0.03
+    else:
+        thresh = base
+
+    if is_live:
+        thresh = max(LIVE_SCAN_PROB_THRESHOLD, thresh + 0.03)
+
+    return round(min(0.85, thresh), 3)
 
 def _tq_runner():
     asyncio.run(_async_tq_worker())
@@ -2757,17 +2790,14 @@ class TechnicalBrain:
                 + new_vwap_component
             )
 
-        if vix > 20:
-            score *= 0.75
-
-            if shadow_score is not None:
-                shadow_score *= 0.75
-
         if vix > 28:
             score *= 0.60
-
             if shadow_score is not None:
                 shadow_score *= 0.60
+        elif vix > 20:
+            score *= 0.75
+            if shadow_score is not None:
+                shadow_score *= 0.75
 
         if shadow_score is not None:
 
@@ -3925,13 +3955,14 @@ class Fmt:
         )
 
     @staticmethod
-    def vip_no_setup(cfg: dict, signal_type: str, prob: float, vix: float = 15.0) -> str:
+    def vip_no_setup(cfg: dict, signal_type: str, prob: float, vix: float = 15.0,
+                     threshold: float = SNIPER_MIN_PROB) -> str:
         insight = _generate_ai_hook(cfg['label'], "NEUTRAL", vix, alert_type="insight")
 
         if signal_type == "CHOP":
             reason = "Range-bound — Iron Condor advisory sent above"
         elif signal_type == "HOLD":
-            reason = f"Prob `{prob:+.4f}` below threshold `{SNIPER_MIN_PROB}` — waiting for conviction"
+            reason = f"Prob `{prob:+.4f}` below threshold `{threshold:.2f}` — waiting for conviction"
         elif signal_type == "WARMUP":
             reason = "Not enough candle data yet — still warming up"
         else:
@@ -4967,6 +4998,9 @@ class DailySignalEngine:
         self._last_vix    = 15.0
 
         self._last_sniper: dict  = {}
+        # In DailySignalEngine.__init__():
+        self._last_strong_breakout: dict = {}
+
         self._last_bk_check      = 0.0
         self._strong_breakout_pending = {}
         self._strong_breakout_last_candle = {}
@@ -5291,6 +5325,7 @@ class DailySignalEngine:
             self._best_signal        = None
             self._last_results       = []
             self._last_sniper        = {}
+            self._last_strong_breakout  = {}
             self._strong_breakout_pending.clear()
             self._strong_breakout_fired.clear()
             _log.info(f"🌅 New trading day: {today}")
@@ -5332,6 +5367,14 @@ class DailySignalEngine:
                     now_hm,
                 )
                 return False
+            if not _is_valid_entry_window(now_hm):
+                _log.info(
+                    "[STRONG BK %s] Blocked: outside entry window (%s)",
+                    idx_key,
+                    now_hm,
+                )
+                return False
+            
             direction = breakout.get("direction")
             expected_direction = "CE" if direction == "UP" else "PE"
 
@@ -5382,7 +5425,7 @@ class DailySignalEngine:
 
             prob = abs(float(analysis.get("prob", 0)))
 
-            min_prob = float(cfg.get("min_prob", 0.60))
+            min_prob = _effective_prob_threshold(idx_key, is_live=False)
 
             if prob < min_prob:
                 _log.info(
@@ -5638,13 +5681,13 @@ class DailySignalEngine:
             "exceptions": 0,
         }
 
-        dyn_sniper_thresh = _afternoon_prob_threshold()
-        scalp_blocked     = now_hm >= NO_NEW_SCALP_HM
-        sniper_blocked    = now_hm >= NO_NEW_SNIPER_HM
+        nifty_thresh   = _effective_prob_threshold("NIFTY", is_live=False)
+        scalp_blocked  = now_hm >= NO_NEW_SCALP_HM
+        sniper_blocked = now_hm >= NO_NEW_SNIPER_HM
 
         _log.info(
             f"🔍 Scan [{label}] {now_hm}  VIX={vix:.1f}  "
-            f"sniper_thresh={dyn_sniper_thresh:.2f}  "
+            f"nifty_thresh={nifty_thresh:.2f}  "
             f"scalp={'BLOCKED' if scalp_blocked else 'OK'}  "
             f"sniper={'BLOCKED' if sniper_blocked else 'OK'}"
         )
@@ -5691,18 +5734,28 @@ class DailySignalEngine:
                 self._last_regime = analysis.get("regime", "CHOP")
 
                 # 🔥 1. TIME-WINDOW FILTER (Eliminate Lunchtime Chop)
+                # 🔥 1. TIME-WINDOW FILTER (Eliminate Lunchtime Chop)
                 now_hm = _ist_now().strftime("%H:%M")
-                is_valid_time = ("09:25" <= now_hm <= "11:15") or ("13:30" <= now_hm <= "14:45")
+                is_valid_time = _is_valid_entry_window(now_hm)
 
-                # 🔥 2. INDEX-SPECIFIC PROBABILITY FLOOR
-                min_required_prob = cfg.get("min_prob", 0.60)
+                # 🔥 2. DYNAMIC INDEX + TIME-OF-DAY PROBABILITY FLOOR
+                min_required_prob = _effective_prob_threshold(idx_key, is_live=False)
                 signal_prob = abs(analysis.get("prob", 0))
+                active_dir = self.monitor.get_active_direction(idx_key)
+
+                # Allow the -0.05 reversal relaxation to reach the reversal logic below
+                is_potential_reversal = (
+                    active_dir is not None
+                    and analysis.get("direction") is not None
+                    and active_dir != analysis["direction"]
+                )
+                entry_floor = (min_required_prob - 0.05) if is_potential_reversal else min_required_prob
 
                 if not is_valid_time and analysis["signal_type"] in ["SNIPER", "SCALP"]:
                     _log.info(f"⏳ Skipping {idx_key}: Outside high-momentum windows")
                     analysis["signal_type"] = "HOLD"
-                elif signal_prob < min_required_prob and analysis["signal_type"] in ["SNIPER", "SCALP"]:
-                    _log.info(f"⚠️ Signal blocked for {idx_key}: Prob {signal_prob:.3f} < {min_required_prob} threshold")
+                elif signal_prob < entry_floor and analysis["signal_type"] in ["SNIPER", "SCALP"]:
+                    _log.info(f"⚠️ Signal blocked for {idx_key}: Prob {signal_prob:.3f} < {entry_floor:.3f} threshold")
                     analysis["signal_type"] = "HOLD"
 
                 sniper     = self.strategy.sniper(analysis, snap, idx_key)
@@ -5987,7 +6040,10 @@ class DailySignalEngine:
 
                 else:
                     if not sniper["active"] and not stealth_mode and active_dir is None:
-                        _to_vip(Fmt.vip_no_setup(cfg, analysis["signal_type"], analysis["prob"], vix=vix))
+                        _to_vip(Fmt.vip_no_setup(
+                            cfg, analysis["signal_type"], analysis["prob"],
+                            vix=vix, threshold=min_required_prob
+                        ))
 
                 # ── VIP: Swing ────────────────────────────────────────────────
                 # FIX: One swing trade per index per day (not one for the whole market)
@@ -6220,7 +6276,7 @@ class DailySignalEngine:
         now_hm = _ist_now().strftime("%H:%M")
 
         # 1. TIME-WINDOW FILTER (Matches scheduled scan)
-        is_valid_time = ("09:25" <= now_hm <= "11:15") or ("13:30" <= now_hm <= "14:45")
+        is_valid_time = _is_valid_entry_window(now_hm)
         if not is_valid_time:
             return
 
@@ -6273,7 +6329,7 @@ class DailySignalEngine:
                 prob     = analysis.get("prob", 0.0)
 
                 # 🔥 INDEX-SPECIFIC PROBABILITY FLOOR
-                min_required_prob = cfg.get("min_prob", 0.60)
+                min_required_prob = _effective_prob_threshold(idx_key, is_live=True)
                 if abs(prob) < min_required_prob:
                     continue
 
@@ -6363,7 +6419,7 @@ class DailySignalEngine:
                 is_jackpot = (
                     (idx_key in ["NIFTY", "FINNIFTY"] and sniper["tp_pts"] >= 80)
                     or
-                    (idx_key in ["BANKNIFTY", "SENSEX"] and sniper["tp_pts"] >= 200)
+                    (idx_key in ["BANKNIFTY", "SENSEX"] and sniper["tp_pts"] >= 180)
                 )
 
                 if is_hero:
@@ -6680,42 +6736,58 @@ class DailySignalEngine:
                     time.sleep(3600)
                     continue
 
-                if   now >= SCANS["pre_market"]  and "pre"          not in self._fired:
-                    self._do_pre_market();      self._fired.add("pre")
-                elif now >= SCANS["swing_close"] and "swing_close"  not in self._fired:
-                    _log.info("⏰ 09:25 — Force closing overnight SWING positions.")
-                    self.monitor.force_close_swing(); self._fired.add("swing_close")
-                elif now >= SCANS["scan_945"]    and "scan_945"     not in self._fired:
-                    self.run_scan("09:45 Morning Breakout"); self._fired.add("scan_945")
-                elif now >= SCANS["scan_1030"]   and "scan_1030"    not in self._fired:
-                    self.run_scan("10:30 Trend Continuation")
-                    self._do_mid_morning_free(); self._fired.add("scan_1030")
-                elif now >= SCANS["scan_1130"]   and "scan_1130"    not in self._fired:
-                    self.run_scan("11:30 Pre-Lunch"); self._fired.add("scan_1130")
-                elif now >= SCANS["scan_1230"] and "scan_1230" not in self._fired:
-                    self.run_scan("12:30 Midday Market Scan"); self._fired.add("scan_1230")
-                elif now >= SCANS["scan_1315"]   and "scan_1315"    not in self._fired:
-                    self.run_scan("13:15 Afternoon Breakout"); self._fired.add("scan_1315")
-                elif now >= SCANS["scan_1400"]   and "scan_1400"    not in self._fired:
-                    self.run_scan("14:00 Final Push")
-                    self._do_afternoon_free(); self._fired.add("scan_1400")
-                elif now >= SCANS["scan_1430"]   and "scan_1430"    not in self._fired:
-                    self.run_scan("14:30 Swing Window"); self._fired.add("scan_1430")
-                elif now >= SCANS["pre_close"]   and "pre_close"    not in self._fired:
-                    self._do_pre_close_free(); self._fired.add("pre_close")
-                elif now >= SCANS["force_close"] and "force_close"  not in self._fired:
-                    _log.info("⏰ 15:25 — Force closing all intraday positions.")
-                    self.monitor.force_close_intraday(); self._fired.add("force_close")
-                elif now >= SCANS["eod"]         and "eod"          not in self._fired:
-                    self._do_eod(); self._fired.add("eod")
-                elif self._is_market_hours() and "09:15" <= now < INTRADAY_CUTOFF_HM:
-                    # Continuous breakout monitoring throughout market hours.
-                    # Breakout monitoring starts at 09:15, not after the 09:45 scan.
-                    self._live_breakout_check()
+                if now >= SCANS["pre_market"] and "pre" not in self._fired:
+                    self._do_pre_market()
+                    self._fired.add("pre")
 
-                    # Keep existing live sniper schedule unchanged.
-                    if "scan_945" in self._fired:
-                        self._live_sniper_check()
+                elif now >= SCANS["swing_close"] and "swing_close" not in self._fired:
+                    _log.info("⏰ 09:25 — Force closing overnight SWING positions.")
+                    self.monitor.force_close_swing()
+                    self._fired.add("swing_close")
+
+                elif now >= SCANS["scan_935"] and "scan_935" not in self._fired:
+                    self.run_scan("09:35 Opening Range Breakout")
+                    self._fired.add("scan_935")
+
+                elif now >= SCANS["scan_1005"] and "scan_1005" not in self._fired:
+                    self.run_scan("10:05 Morning Trend Confirmation")
+                    self._do_mid_morning_free()
+                    self._fired.add("scan_1005")
+
+                elif now >= SCANS["scan_1045"] and "scan_1045" not in self._fired:
+                    self.run_scan("10:45 Trend Continuation / VWAP Bounce")
+                    self._fired.add("scan_1045")
+
+                elif now >= SCANS["scan_1330"] and "scan_1330" not in self._fired:
+                    self.run_scan("13:30 Afternoon Activity")
+                    self._fired.add("scan_1330")
+
+                elif now >= SCANS["scan_1400"] and "scan_1400" not in self._fired:
+                    self.run_scan("14:00 Afternoon Trend")
+                    self._do_afternoon_free()
+                    self._fired.add("scan_1400")
+
+                elif now >= SCANS["scan_1430"] and "scan_1430" not in self._fired:
+                    self.run_scan("14:30 Final Entry Opportunity")
+                    self._fired.add("scan_1430")
+
+                elif now >= SCANS["pre_close"] and "pre_close" not in self._fired:
+                    self._do_pre_close_free()
+                    self._fired.add("pre_close")
+
+                elif now >= SCANS["force_close"] and "force_close" not in self._fired:
+                    _log.info("⏰ 15:25 — Force closing all intraday positions.")
+                    self.monitor.force_close_intraday()
+                    self._fired.add("force_close")
+
+                elif now >= SCANS["eod"] and "eod" not in self._fired:
+                    self._do_eod()
+                    self._fired.add("eod")
+
+                elif self._is_market_hours() and "scan_935" in self._fired:
+                    # Between scheduled scans: continuous live monitoring
+                    self._live_breakout_check()
+                    self._live_sniper_check()
 
                 self._save_state()
 
