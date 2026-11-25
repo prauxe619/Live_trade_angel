@@ -801,7 +801,7 @@ SCALP_MIN_PROB      = 0.35
 CHOP_PROB_CEILING   = 0.30
 SWING_MIN_SCORE     = 4
 SWING_MIN_PROB      = 0.70
-SNIPER_COOLDOWN_MIN = 90
+SNIPER_COOLDOWN_MIN = 45
 SWING_NO_TRAIL      = 99999   # sentinel: swing trades do not use trailing SL
 BREAKOUT_LOOKBACK   = 25
 
@@ -821,7 +821,7 @@ SCANS = {
     "scan_1045":   "10:45",   # Trend continuation / VWAP bounce
 
     # Prime Window 2: Afternoon Institutional Flow & 0DTE Gamma
-    "scan_1330":   "13:30",   # European overlap & afternoon volume return
+    "scan_1335":   "13:35",   # European overlap & afternoon volume return
     "scan_1400":   "14:00",   # Primary afternoon breakout / 0DTE push
     "scan_1430":   "14:30",   # Final high-conviction entry cutoff
 
@@ -904,8 +904,8 @@ async def _async_tq_worker():
 
 
 def _is_valid_entry_window(now_hm: str) -> bool:
-    """Matches your Prime Window 1 (09:35-10:45) and Prime Window 2 (13:30-14:30)."""
-    return ("09:30" <= now_hm <= "11:05") or ("13:30" <= now_hm <= "14:35")
+    """Matches your Prime Window 1 (09:35-10:45) and Prime Window 2 (13:35-14:30)."""
+    return ("09:30" <= now_hm <= "11:05") or ("13:35" <= now_hm <= "14:35")
 
 def _effective_prob_threshold(index_key: str, is_live: bool = False) -> float:
     """
@@ -5858,7 +5858,10 @@ class DailySignalEngine:
 
                 # ── VIP: Sniper ───────────────────────────────────────────────
                 # 🔥 REVERSAL FIX: Accept lowered threshold if it is a reversal flip
-                if sniper["active"] and not sniper_blocked and self._sniper_cooldown_ok(idx_key) \
+                # ── VIP: Sniper ───────────────────────────────────────────────
+                # 🔥 REVERSAL FIX: Reversals bypass 90m fresh-entry cooldown (already gated by 15m hold & 30m rev cooldown)
+                if sniper["active"] and not sniper_blocked \
+                    and (self._sniper_cooldown_ok(idx_key) or is_reversal) \
                     and (abs(analysis["prob"]) >= min_required_prob or (is_reversal and abs(analysis["prob"]) >= (min_required_prob - 0.05))):
 
                     # Preserve original 1-step ITM strike for Zero-to-Hero.
@@ -5919,7 +5922,8 @@ class DailySignalEngine:
                         )
                     
                     is_hero = (
-                        abs(float(analysis.get("prob", 0.0))) >= 0.85
+                        bool(hero_expiry)
+                        and abs(float(analysis.get("prob", 0.0))) >= 0.85
                         and "12:30" <= current_time <= "14:45"
                     )
                     if is_hero:
@@ -6409,7 +6413,8 @@ class DailySignalEngine:
                     )
                 
                 is_hero = (
-                    abs(analysis["prob"]) >= 0.85
+                    bool(hero_expiry)
+                    and abs(analysis["prob"]) >= 0.85
                     and "12:30" <= current_time <= "14:45"
                 )
                 if is_hero:
@@ -6758,9 +6763,9 @@ class DailySignalEngine:
                     self.run_scan("10:45 Trend Continuation / VWAP Bounce")
                     self._fired.add("scan_1045")
 
-                elif now >= SCANS["scan_1330"] and "scan_1330" not in self._fired:
-                    self.run_scan("13:30 Afternoon Activity")
-                    self._fired.add("scan_1330")
+                elif now >= SCANS["scan_1335"] and "scan_1335" not in self._fired:
+                    self.run_scan("13:35 Afternoon Activity")
+                    self._fired.add("scan_1335")
 
                 elif now >= SCANS["scan_1400"] and "scan_1400" not in self._fired:
                     self.run_scan("14:00 Afternoon Trend")
