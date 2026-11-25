@@ -477,6 +477,166 @@ TRADE_LOTS = int(os.getenv("TRADE_LOTS", "1"))
 if TRADE_LOTS < 1:
     raise ValueError("TRADE_LOTS must be an integer >= 1")
 
+
+
+def _persist_vwap_shadow_collection(
+    index_key: str,
+    candles: pd.DataFrame,
+    shadow: dict,
+) -> None:
+    """
+    Persist independent futures-session VWAP collection observations.
+
+    One row per index per minute.
+    A valid observation cannot be overwritten by an invalid one.
+    Analytics-only: never affects trading decisions.
+    """
+
+    def _num(value):
+        try:
+            value = float(value)
+            return value if math.isfinite(value) else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _integer(value):
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    try:
+        if not isinstance(shadow, dict):
+            shadow = {}
+
+        observed_at = _ist_now()
+        observation_minute = observed_at.replace(
+            second=0,
+            microsecond=0,
+        )
+
+        spot_price = None
+
+        if (
+            isinstance(candles, pd.DataFrame)
+            and not candles.empty
+            and "close" in candles.columns
+        ):
+            spot_price = _num(candles["close"].iloc[-1])
+
+        futures_latest_timestamp = None
+        raw_timestamp = shadow.get("latest_timestamp")
+
+        if raw_timestamp:
+            parsed = pd.to_datetime(
+                raw_timestamp,
+                errors="coerce",
+                utc=True,
+            )
+            if not pd.isna(parsed):
+                futures_latest_timestamp = parsed.to_pydatetime()
+
+        shadow_valid = bool(shadow.get("valid"))
+
+        with _shared_db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.vwap_shadow_collection_observations
+                    AS current (
+                        observed_at,
+                        session_date,
+                        observation_minute,
+                        symbol,
+                        spot_price,
+                        session_vwap,
+                        session_distance,
+                        session_direction,
+                        futures_latest_close,
+                        futures_latest_timestamp,
+                        futures_token,
+                        futures_expiry,
+                        futures_volume_sum,
+                        futures_valid_bars,
+                        futures_positive_volume_bars,
+                        futures_coverage_pct,
+                        shadow_valid,
+                        shadow_reason
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s
+                    )
+                    ON CONFLICT (
+                        session_date,
+                        symbol,
+                        observation_minute
+                    )
+                    DO UPDATE SET
+                        observed_at = EXCLUDED.observed_at,
+                        spot_price = EXCLUDED.spot_price,
+                        session_vwap = EXCLUDED.session_vwap,
+                        session_distance = EXCLUDED.session_distance,
+                        session_direction = EXCLUDED.session_direction,
+                        futures_latest_close = EXCLUDED.futures_latest_close,
+                        futures_latest_timestamp = EXCLUDED.futures_latest_timestamp,
+                        futures_token = EXCLUDED.futures_token,
+                        futures_expiry = EXCLUDED.futures_expiry,
+                        futures_volume_sum = EXCLUDED.futures_volume_sum,
+                        futures_valid_bars = EXCLUDED.futures_valid_bars,
+                        futures_positive_volume_bars =
+                            EXCLUDED.futures_positive_volume_bars,
+                        futures_coverage_pct = EXCLUDED.futures_coverage_pct,
+                        shadow_valid = EXCLUDED.shadow_valid,
+                        shadow_reason = EXCLUDED.shadow_reason
+                    WHERE
+                        NOT current.shadow_valid
+                        OR EXCLUDED.shadow_valid
+                    """,
+                    (
+                        observed_at,
+                        observed_at.date(),
+                        observation_minute,
+                        str(index_key),
+                        spot_price,
+                        _num(shadow.get("vwap")),
+                        _num(shadow.get("distance")),
+                        shadow.get("direction"),
+                        _num(shadow.get("latest_close")),
+                        futures_latest_timestamp,
+                        shadow.get("token"),
+                        shadow.get("expiry"),
+                        _num(shadow.get("volume_sum")),
+                        _integer(
+                            shadow.get(
+                                "valid_bar_count",
+                                shadow.get("bar_count"),
+                            )
+                        ),
+                        _integer(shadow.get("positive_volume_bar_count")),
+                        _num(shadow.get("coverage_pct")),
+                        shadow_valid,
+                        shadow.get("reason"),
+                    ),
+                )
+
+        _log.info(
+            "[VWAP SHADOW COLLECTION SAVED] %s | valid=%s | "
+            "vwap=%s | coverage=%s%%",
+            index_key,
+            shadow_valid,
+            shadow.get("vwap"),
+            shadow.get("coverage_pct"),
+        )
+
+    except Exception:
+        _log.exception(
+            "[VWAP SHADOW COLLECTION SAVE FAILED] %s",
+            index_key,
+        )
+
+
 def _display_trade_lots(index_key: str) -> int:
     """
     Lot count for engine P&L estimates.
@@ -1877,6 +2037,16 @@ class SignalDataFetcher:
                     index_key,
                     futures_exc,
                 )
+            # Independent VWAP collection persistence.
+            # Runs for both valid and invalid futures observations.
+            _persist_vwap_shadow_collection(
+                index_key=index_key,
+                candles=candles,
+                shadow=candles.attrs.get(
+                    "session_vwap_shadow",
+                    {},
+                ),
+            )
 
             _log.info(
                 "%s: Loaded %d validated PostgreSQL spot candles",
