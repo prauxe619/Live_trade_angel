@@ -4748,18 +4748,35 @@ class DailySignalEngine:
 
         # Start broker reconciliation before the strategy begins generating signals.
         # This is required even when new entries are disabled or LIVE_SHADOW is on.
-        from trading_live.engine_hooks import live_management_requested
-        if live_management_requested():
+        from trading_live.engine_hooks import (
+            live_management_requested,
+            live_execution_requested,
+        )
+        
+        # Initialise the shared authenticated broker before any live hook can use it.
+        # This covers both existing-position management and new-entry execution.
+        if live_management_requested() or live_execution_requested():
             try:
                 from trading_live.live_bridge import get_bridge
+        
                 bridge = get_bridge(auth_provider=self.fetcher)
+        
+                if getattr(bridge.broker, "_auth_provider", None) is not self.fetcher:
+                    raise RuntimeError(
+                        "LiveBridge is not bound to the SignalDataFetcher authentication provider"
+                    )
+        
                 _log.info(
-                    "LIVE bridge bootstrapped at engine startup (shadow=%s, entry_enabled=%s)",
-                    bridge.cfg.shadow, bridge.entry_enabled,
+                    "LIVE bridge bootstrapped successfully "
+                    "(shadow=%s, entry_enabled=%s, shared_auth=True)",
+                    bridge.cfg.shadow,
+                    bridge.entry_enabled,
                 )
+        
             except Exception:
                 _log.critical(
-                    "LIVE bridge startup/reconciliation failed; refusing to start the signal engine",
+                    "LIVE bridge startup/authentication initialization failed; "
+                    "refusing to start the signal engine",
                     exc_info=True,
                 )
                 raise
