@@ -6032,9 +6032,49 @@ class DailySignalEngine:
 
                 # ── VIP: Iron Condor on chop ──────────────────────────────────
                 # ── VIP: Iron Condor on chop — once per index per day ─────────
-                if analysis["signal_type"] == "CHOP" and idx_key not in self._ic_fired_today:
-                    _to_vip(Fmt.vip_iron_condor(cfg, chop, spot, vix))
-                    self._ic_fired_today.add(idx_key)
+                
+                # ── VIP: Iron Condor advisory — only when strategy is active ──
+                if (
+                    analysis["signal_type"] == "CHOP"
+                    and idx_key not in self._ic_fired_today
+                    and isinstance(chop, dict)
+                    and chop.get("active") is True
+                ):
+                    required_ic_fields = (
+                        "short_call",
+                        "long_call",
+                        "short_put",
+                        "long_put",
+                        "profit_zone",
+                        "range_pts",
+                        "expiry",
+                    )
+                
+                    missing_ic_fields = [
+                        field for field in required_ic_fields
+                        if chop.get(field) is None
+                    ]
+                
+                    try:
+                        valid_ic_range = (
+                            math.isfinite(float(chop["range_pts"]))
+                            and float(chop["range_pts"]) > 0
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        valid_ic_range = False
+                
+                    if missing_ic_fields or not valid_ic_range:
+                        _log.warning(
+                            "[IRON CONDOR BLOCKED] %s | missing_fields=%s "
+                            "| valid_range=%s",
+                            idx_key,
+                            missing_ic_fields,
+                            valid_ic_range,
+                        )
+                    else:
+                        _to_vip(Fmt.vip_iron_condor(cfg, chop, spot, vix))
+                        self._ic_fired_today.add(idx_key)
+
 
                 # ── VIP: Key levels ───────────────────────────────────────────
                 if bk["active"] and not stealth_mode:
