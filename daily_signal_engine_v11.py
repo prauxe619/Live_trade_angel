@@ -4807,22 +4807,35 @@ class TargetMonitor:
                 _log.info(f"SL hit: {sig.signal_id}  loss₹{trade_loss}")
 
 
-    def force_close_intraday(self):
-        """15:25 — square off all non-swing positions."""
+    def force_close_intraday(self) -> bool:
+        """15:12 — square off all non-swing positions. Returns True only if all closed."""
         with self._lock:
             signals = list(self._signals.values())
+        all_closed = True
         for sig in signals:
             if sig.active and sig.signal_type != "SWING":
                 curr = self.fetcher.get_option_premium(
                     sig.index_key, sig.strike, sig.direction, sig.expiry, side="bid")
                 if curr <= 0:
-                    _log.error("Force-close blocked: no validated bid for %s; signal remains open", sig.signal_id)
+                    _log.warning(
+                        "Force-close bid unavailable for %s; falling back to fresh LTP",
+                        sig.signal_id,
+                    )
+                    curr = self.fetcher.get_option_premium(
+                        sig.index_key, sig.strike, sig.direction, sig.expiry, side="ltp")
+                if curr <= 0:
+                    _log.error(
+                        "Force-close blocked: no validated bid or ltp for %s; will retry",
+                        sig.signal_id,
+                    )
+                    all_closed = False
                     continue
-                # force_close_intraday()
+
                 if not sig.is_free_signal:
                     from trading_live.engine_hooks import submit_engine_exit
                     if not submit_engine_exit(sig, "3:25_EXIT", curr):
-                        _log.error("LIVE EOD exit not confirmed: %s", sig.signal_id)
+                        _log.error("LIVE EOD exit not confirmed: %s; will retry", sig.signal_id)
+                        all_closed = False
                         continue
 
                 # v9/v11: atomic close guard
@@ -4845,7 +4858,7 @@ class TargetMonitor:
                     f"📥 <b>Entry : ₹{sig.entry_premium:.1f}</b>\n"
                     f"📈 <b>Exit  : ₹{curr:.1f}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"💰 <b>{TRADE_LOTS}-Lot P&L : ₹{trade_profit:,}</b>\n"
+                    f"💰 <b>{trade_lots}-Lot P&L : ₹{trade_profit:,}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"<i>Market closing. All intraday positions squared off.</i> ⏳\n"
                     f"🕒 <i>{_ist_now().strftime('%d %b  %H:%M')}</i>"
@@ -4853,6 +4866,8 @@ class TargetMonitor:
                 _update_signal_exit(sig.signal_id, curr, curr - sig.entry_premium,
                                     trade_profit, "3:25_EXIT")
                 _log.info(f"Force closed {sig.signal_id} at {curr}")
+        return all_closed
+
 
     def force_close_swing(self):
         """09:25 — square off all overnight SWING positions."""
@@ -6742,6 +6757,16 @@ class DailySignalEngine:
                 if wday >= 5:
                     time.sleep(3600)
                     continue
+                # ── TOP PRIORITY: Intraday Force Close (never blocked by earlier scans; retries every 60s until 15:30) ──
+                if SCANS["force_close"] <= now < SCANS["eod"] and "force_close" not in self._fired:
+                    _log.info(f"⏰ {now} — Force closing all intraday positions.")
+                    if self.monitor.force_close_intraday():
+                        self._fired.add("force_close")
+                    else:
+                        _log.warning("⚠️ Force close incomplete — will retry in 60s.")
+                    self._save_state()
+                    time.sleep(60)
+                    continue
 
                 if now >= SCANS["pre_market"] and "pre" not in self._fired:
                     self._do_pre_market()
@@ -6781,11 +6806,6 @@ class DailySignalEngine:
                 elif now >= SCANS["pre_close"] and "pre_close" not in self._fired:
                     self._do_pre_close_free()
                     self._fired.add("pre_close")
-
-                elif now >= SCANS["force_close"] and "force_close" not in self._fired:
-                    _log.info("⏰ 15:12 — Force closing all intraday positions.")
-                    self.monitor.force_close_intraday()
-                    self._fired.add("force_close")
 
                 elif now >= SCANS["eod"] and "eod" not in self._fired:
                     self._do_eod()
