@@ -38,7 +38,6 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from datetime import datetime, date
-from scipy.stats import norm
 from SmartApi import SmartConnect
 from revenue_agent.telegram_vip_alert import send_telegram_message
 from collectors.scripts.shared_snapshots import publish_snapshot as publish_market_snapshot
@@ -76,7 +75,8 @@ CONFIG = {
     # BankNifty-specific option chain scope
     "STRIKE_STEP"     : 100,       # BankNifty strikes are every 100
     "ATM_RANGE"       : 15,        # +-15 strikes = 31 strikes per expiry
-    "NUM_EXPIRIES"    : 3,         # nearest 3 expiries
+    "NUM_EXPIRIES"    : 2,         # nearest 2 expiries
+    "OFFSET_SEC"      : 15,        # wake at :15 each minute
 
     # Finance
     "RISK_FREE_RATE"  : 0.065,     # RBI repo rate proxy
@@ -97,6 +97,15 @@ CONFIG = {
     "IV_SKEW_WINGS"   : 3,         # +-3 strikes from ATM for skew calculation
     "IV_HISTORY_BARS" : 20,        # bars to track IV trend
 }
+
+_SQRT2 = math.sqrt(2.0)
+_INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / _SQRT2))
+
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) * _INV_SQRT_2PI
 
 logging.basicConfig(
     level=logging.INFO,
@@ -409,10 +418,10 @@ class BankNiftyCollector:
             d1 = (log_moneyness + (r + 0.5 * iv ** 2) * t) / (iv * sqt)
             d2 = d1 - iv * sqt
 
-            Nd1  = norm.cdf(d1)
-            Nd2  = norm.cdf(d2)
-            Nd2_ = norm.cdf(-d2)
-            nd1  = norm.pdf(d1)
+            Nd1  = _norm_cdf(d1)
+            Nd2  = _norm_cdf(d2)
+            Nd2_ = _norm_cdf(-d2)
+            nd1  = _norm_pdf(d1)
 
             # -- Standard Greeks -----------------------------------------
             gamma = nd1 / (spot * iv * sqt)
@@ -497,6 +506,12 @@ class BankNiftyCollector:
 
         try:
             df = pd.DataFrame(batch)
+            if "iv_valid" in df.columns:
+                df = df[df["iv_valid"] == True]
+            else:
+                df = df[pd.to_numeric(df.get("iv_used", 0), errors="coerce") > 0]
+            if df.empty:
+                return surface
             skew_wing = CONFIG["IV_SKEW_WINGS"] * CONFIG["STRIKE_STEP"]  # 3 x 100 = 300
 
             atm_ce = df[(df['strike'] == atm_strike) & (df['type'] == 'CE')]
@@ -504,8 +519,9 @@ class BankNiftyCollector:
 
             atm_ce_iv = float(atm_ce['iv_used'].mean()) if not atm_ce.empty else 0.0
             atm_pe_iv = float(atm_pe['iv_used'].mean()) if not atm_pe.empty else 0.0
-            surface['atm_iv']          = round((atm_ce_iv + atm_pe_iv) / 2, 4)
-            surface['put_call_iv_gap'] = round(atm_pe_iv - atm_ce_iv, 4)
+            valid_atm_ivs = [v for v in (atm_ce_iv, atm_pe_iv) if v > 0]
+            surface['atm_iv'] = round(float(np.mean(valid_atm_ivs)), 4) if valid_atm_ivs else 0.0
+            surface['put_call_iv_gap'] = round(atm_pe_iv - atm_ce_iv, 4) if atm_ce_iv > 0 and atm_pe_iv > 0 else 0.0
 
             otm_ce = df[(df['strike'] == atm_strike + skew_wing) & (df['type'] == 'CE')]
             otm_pe = df[(df['strike'] == atm_strike - skew_wing) & (df['type'] == 'PE')]
@@ -661,8 +677,9 @@ class BankNiftyCollector:
         scaled_gex   = float(np.sign(raw_net_gex) * np.log1p(abs(raw_net_gex)))
         call_gamma   = safe_sum(ce, 'gamma') * 100
         put_gamma    = safe_sum(pe, 'gamma') * 100
-        avg_vanna    = safe_mean(batch, 'vanna')
-        avg_theta    = safe_mean(batch, 'theta')
+        greek_rows = [r for r in batch if r.get('iv_valid') is True]
+        avg_vanna    = safe_mean(greek_rows, 'vanna')
+        avg_theta    = safe_mean(greek_rows, 'theta')
 
         # -- Microstructure ----------------------------------------------------
         avg_obi        = safe_mean(batch, 'obi')
@@ -674,8 +691,8 @@ class BankNiftyCollector:
         call_charm           = safe_sum(ce, 'charm_exposure')
         put_charm            = safe_sum(pe, 'charm_exposure')
         total_vanna_exposure = safe_sum(batch, 'vanna_exposure')
-        avg_vomma = safe_mean(batch, 'vomma')
-        avg_zomma = safe_mean(batch, 'zomma')
+        avg_vomma = safe_mean(greek_rows, 'vomma')
+        avg_zomma = safe_mean(greek_rows, 'zomma')
 
         # -- OTM Pressure Signals ---------------------------------------------
         atm = round(self.last_spot / CONFIG["STRIKE_STEP"]) * CONFIG["STRIKE_STEP"] if self.last_spot else 0
@@ -898,20 +915,10 @@ class BankNiftyCollector:
                 "realized_vol"      : realized_vol,
                 "iv_rv_spread"      : iv_rv_spread,
                 "max_pain"          : max_pain,
-                "regime"            : regime,
-                "candles_fresh": candles_fresh,
-
-                "candle_quality": (
-                    "angelone_websocket_ohlc"
-                    if candles_fresh
-                    else "unavailable"
-                ),
-                
+                "regime"            : regime,                
                 "candle_quality_status": candle_quality_status,
                 
                 "candle_count": len(formatted_candles),
-                
-                "latest_candle_age_s": latest_candle_age_s,
                 
                 "trading_data_eligible": candles_fresh,
                 
@@ -1266,8 +1273,13 @@ class BankNiftyCollector:
                     )
 
                 # -- Precise minute alignment ---------------------------------
-                time.sleep(max(0, 60 - (now.second + now.microsecond / 1e6)))
-                ts = datetime.now(CONFIG["TZ"]).replace(second=0, microsecond=0)
+                # -- Staggered minute alignment --------------------------------
+                _now = datetime.now(CONFIG["TZ"])
+                wait_s = (CONFIG["OFFSET_SEC"] - (_now.second + _now.microsecond / 1e6)) % 60
+                if wait_s < 1.0:
+                    wait_s += 60.0
+                time.sleep(wait_s)
+                ts = datetime.now(CONFIG["TZ"]).replace(microsecond=0)
 
                 # Re-check close AFTER the alignment sleep so no extra tick
                 # is collected at/after MARKET_CLOSE.
@@ -1448,6 +1460,8 @@ class BankNiftyCollector:
                             continue
 
                         dte = (exp - ts.date()).days
+                        tok_to_strike = dict(zip(batch_nfo["token"].astype(str), batch_nfo["strike"]))
+                        sym_to_strike = dict(zip(batch_nfo["symbol"], batch_nfo["strike"]))
 
                         for item in fetched_items:
                             # --- PERMANENT FIX: Match tokens definitively ---
@@ -1455,17 +1469,13 @@ class BankNiftyCollector:
                             tok = str(item.get('symbolToken', ''))
                             
                             # Bulletproof matching by token ID
-                            match = batch_nfo[batch_nfo['token'].astype(str) == tok]
-                            
-                            # Fallback to string match if token is somehow missing
-                            if match.empty:
-                                match = batch_nfo[batch_nfo['symbol'] == sym]
-                                
-                            if match.empty:
+                            strike = tok_to_strike.get(tok)
+                            if strike is None:
+                                strike = sym_to_strike.get(sym)
+                            if strike is None:
                                 logger.warning(f"DEBUG_SKIP: {sym} (tok: {tok}) not found in batch")
                                 continue
-
-                            strike = float(match['strike'].iloc[0])
+                            strike = float(strike)
                             otype  = "CE" if sym.endswith("CE") else "PE"
 
                             oi_key = (sym, str(exp), strike, otype)
@@ -1479,7 +1489,7 @@ class BankNiftyCollector:
                             
                             if not getattr(self, "_timestamp_debug_done", False):
                                 logger.info(
-                                    "[FINNIFTY] TIMESTAMP DEBUG | keys=%s | feed=%r | trade=%r",
+                                    "[BANKNIFTY] TIMESTAMP DEBUG | keys=%s | feed=%r | trade=%r",
                                     list(item.keys()),
                                     exchange_feed_time,
                                     exchange_trade_time,
@@ -1628,6 +1638,7 @@ class BankNiftyCollector:
                     self.save_live_snapshot(
                         current_batch, aggregates, iv_surface, gex_walls,
                         futures_basis=futures_basis,
+                        futures_basis_valid=futures_basis_valid,
                         futures_basis_pct=futures_basis_pct,
                         realized_vol=rv,
                         iv_rv_spread=iv_rv_spread,
@@ -1645,7 +1656,7 @@ class BankNiftyCollector:
                         logger.info(
                             f"[BN] {ts.strftime('%H:%M')} | "
                             f"Spot: {self.last_spot:.0f} | "
-                            f"VIX: {self.last_vix:.1f} | "
+                            f"VIX: {f'{self.last_vix:.1f}' if self.last_vix is not None else 'N/A'} | "
                             f"ATM IV: {iv_surface.get('atm_iv', 0):.3f} | "
                             f"Net GEX: {aggregates.get('raw_net_gex', 0):.0f} | "
                             f"Pin: {gex_walls.get('pin_strike', 0):.0f}"

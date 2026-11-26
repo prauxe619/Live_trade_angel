@@ -36,7 +36,6 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from datetime import datetime, date
-from scipy.stats import norm
 from SmartApi import SmartConnect
 from revenue_agent.telegram_vip_alert import send_telegram_message
 from collectors.scripts.shared_snapshots import publish_snapshot as publish_market_snapshot
@@ -72,7 +71,8 @@ CONFIG = {
     # ── Sensex-specific option chain scope ──────────────────────
     "STRIKE_STEP"     : 100,       # Sensex strikes are every ₹100
     "ATM_RANGE"       : 15,        # ±15 strikes = 31 strikes per expiry
-    "NUM_EXPIRIES"    : 3,         # weekly + next 2
+    "NUM_EXPIRIES"    : 2,         # weekly + next
+    "OFFSET_SEC"      : 45,        # wake at :45 each minute
 
     # Finance
     "RISK_FREE_RATE"  : 0.065,     # RBI repo rate proxy
@@ -93,6 +93,15 @@ CONFIG = {
     "IV_SKEW_WINGS"   : 3,         # ±3 strikes from ATM for skew calculation
     "IV_HISTORY_BARS" : 20,        # bars to track IV trend
 }
+
+_SQRT2 = math.sqrt(2.0)
+_INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / _SQRT2))
+
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) * _INV_SQRT_2PI
 
 logging.basicConfig(
     level=logging.INFO,
@@ -351,8 +360,8 @@ class SensexCollector:
         d1 = (math.log(spot / strike) + (rate + 0.5 * sigma * sigma) * t) / (sigma * sqrt_t)
         d2 = d1 - sigma * sqrt_t
         if otype == "CE":
-            return spot * norm.cdf(d1) - strike * math.exp(-rate * t) * norm.cdf(d2)
-        return strike * math.exp(-rate * t) * norm.cdf(-d2) - spot * norm.cdf(-d1)
+            return spot * _norm_cdf(d1) - strike * math.exp(-rate * t) * _norm_cdf(d2)
+        return strike * math.exp(-rate * t) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
 
     def estimate_implied_volatility(self, spot: float, strike: float, dte: float,
                                     option_price: float, otype: str) -> float:
@@ -376,10 +385,10 @@ class SensexCollector:
                 return 0.0
             if option_price > self._bs_option_price(spot, strike, t, rate, hi, otype) + 0.05:
                 return 0.0
-            for _ in range(80):
+            for _ in range(40):
                 mid = (lo + hi) / 2
                 model_price = self._bs_option_price(spot, strike, t, rate, mid, otype)
-                if abs(model_price - option_price) < 1e-4:
+                if abs(model_price - option_price) < 1e-3 or (hi - lo) < 1e-4:
                     return mid
                 if model_price < option_price:
                     lo = mid
@@ -451,11 +460,11 @@ class SensexCollector:
             d1 = (log_moneyness + (r + 0.5 * iv ** 2) * t) / (iv * sqt)
             d2 = d1 - iv * sqt
 
-            Nd1  = norm.cdf(d1)
-            Nd1_ = norm.cdf(-d1)
-            Nd2  = norm.cdf(d2)
-            Nd2_ = norm.cdf(-d2)
-            nd1  = norm.pdf(d1)
+            Nd1  = _norm_cdf(d1)
+            Nd1_ = _norm_cdf(-d1)
+            Nd2  = _norm_cdf(d2)
+            Nd2_ = _norm_cdf(-d2)
+            nd1  = _norm_pdf(d1)
 
             # ── Standard Greeks ───────────────────────────────────────────
             gamma = nd1 / (spot * iv * sqt)
@@ -710,8 +719,9 @@ class SensexCollector:
         scaled_gex   = float(np.sign(raw_net_gex) * np.log1p(abs(raw_net_gex)))
         call_gamma   = safe_sum(ce, 'gamma') * 100
         put_gamma    = safe_sum(pe, 'gamma') * 100
-        avg_vanna    = safe_mean(batch, 'vanna')
-        avg_theta    = safe_mean(batch, 'theta')
+        greek_rows = [r for r in batch if r.get('iv_valid') is True]
+        avg_vanna    = safe_mean(greek_rows, 'vanna')
+        avg_theta    = safe_mean(greek_rows, 'theta')
 
         # ── NEW: Average Microstructure Metrics ──
         avg_obi        = safe_mean(batch, 'obi')
@@ -723,8 +733,8 @@ class SensexCollector:
         call_charm           = safe_sum(ce, 'charm_exposure')
         put_charm            = safe_sum(pe, 'charm_exposure')
         total_vanna_exposure = safe_sum(batch, 'vanna_exposure')
-        avg_vomma = safe_mean(batch, 'vomma')
-        avg_zomma = safe_mean(batch, 'zomma')
+        avg_vomma = safe_mean(greek_rows, 'vomma')
+        avg_zomma = safe_mean(greek_rows, 'zomma')
 
         # ── OTM Pressure Signals ─────────────────────────────────────────
         atm = round(self.last_spot / CONFIG["STRIKE_STEP"]) * CONFIG["STRIKE_STEP"] if self.last_spot else 0
@@ -953,20 +963,12 @@ class SensexCollector:
                 "iv_rv_spread"      : iv_rv_spread,
                 "max_pain"          : max_pain,
                 "regime"            : regime,
-                "candles_fresh": candles_fresh,
-                
-                "candle_quality": (
-                    "angelone_websocket_ohlc"
-                    if candles_fresh
-                    else "unavailable"
-                ),
-                
+                                  
                 "candle_quality_status": candle_quality_status,
                 
                 "candle_count": len(formatted_candles),
                 
-                "latest_candle_age_s": latest_candle_age_s,
-                
+               
                 "trading_data_eligible": candles_fresh,
                             }
 
@@ -1269,7 +1271,7 @@ class SensexCollector:
                 current_hour = now.strftime("%Y-%m-%d %H")
                 if (
                     self.last_hour_report != current_hour
-                    and now.minute == 0
+                    and now.minute <= 2 
                     and CONFIG["MARKET_OPEN"] <= now_str < CONFIG["MARKET_CLOSE"]
                 ):
                     self.last_hour_report = current_hour
@@ -1283,8 +1285,13 @@ class SensexCollector:
                         f"⚠️ API Failures: `{self.api_failures}`"
                     )
 
-                time.sleep(max(0, 60 - (now.second + now.microsecond / 1e6)))
-                ts = datetime.now(CONFIG["TZ"]).replace(second=0, microsecond=0)
+                # -- Staggered minute alignment --------------------------------
+                _now = datetime.now(CONFIG["TZ"])
+                wait_s = (CONFIG["OFFSET_SEC"] - (_now.second + _now.microsecond / 1e6)) % 60
+                if wait_s < 1.0:
+                    wait_s += 60.0
+                time.sleep(wait_s)
+                ts = datetime.now(CONFIG["TZ"]).replace(microsecond=0)
                 if ts.strftime("%H:%M") >= CONFIG["MARKET_CLOSE"]:
                     continue
 
@@ -1463,6 +1470,8 @@ class SensexCollector:
                             continue
 
                         dte = (exp - ts.date()).days
+                        tok_to_strike = dict(zip(batch_bfo["token"].astype(str), batch_bfo["strike"]))
+                        sym_to_strike = dict(zip(batch_bfo["symbol"], batch_bfo["strike"]))
 
                         for item in fetched_items:
                             # --- PERMANENT FIX: Match tokens definitively ---
@@ -1470,17 +1479,13 @@ class SensexCollector:
                             tok = str(item.get('symbolToken', ''))
                             
                             # Bulletproof matching by token ID
-                            match = batch_bfo[batch_bfo['token'].astype(str) == tok]
-                            
-                            # Fallback to string match if token is somehow missing
-                            if match.empty:
-                                match = batch_bfo[batch_bfo['symbol'] == sym]
-                                
-                            if match.empty:
+                            strike = tok_to_strike.get(tok)
+                            if strike is None:
+                                strike = sym_to_strike.get(sym)
+                            if strike is None:
                                 logger.warning(f"DEBUG_SKIP: {sym} (tok: {tok}) not found in batch")
                                 continue
-
-                            strike = float(match['strike'].iloc[0])
+                            strike = float(strike)
                             otype  = "CE" if sym.endswith("CE") else "PE"
                             
                             # 2. Build the correct tracking key BEFORE calculations
@@ -1557,7 +1562,7 @@ class SensexCollector:
                             option_price = ((bid + ask) / 2.0) if quote_entry_eligible else 0.0
                             iv_used = self.estimate_implied_volatility(
                                 float(self.last_spot), strike, dte, option_price, otype
-                            )
+                            ) if quote_entry_eligible else 0.0
                             iv_valid = bool(quote_entry_eligible and iv_used > 0 and math.isfinite(iv_used))
                             greeks = self.get_greeks(
                                 self.last_spot, strike, dte,
@@ -1637,6 +1642,7 @@ class SensexCollector:
                     self.save_live_snapshot(
                         current_batch, aggregates, iv_surface, gex_walls,
                         futures_basis=futures_basis,
+                        futures_basis_valid=futures_basis_valid,
                         futures_basis_pct=futures_basis_pct,
                         realized_vol=rv,
                         iv_rv_spread=iv_rv_spread,
@@ -1653,7 +1659,7 @@ class SensexCollector:
                         logger.info(
                             f"[SENSEX] {ts.strftime('%H:%M')} | "
                             f"Spot: {self.last_spot:.0f} | "
-                            f"VIX: {self.last_vix:.1f} | "
+                            f"VIX: {f'{self.last_vix:.1f}' if self.last_vix is not None else 'N/A'} | "
                             f"ATM IV: {iv_surface.get('atm_iv', 0):.3f} | "
                             f"Net GEX: {aggregates.get('raw_net_gex', 0):.0f} | "
                             f"Pin: {gex_walls.get('pin_strike', 0):.0f}"

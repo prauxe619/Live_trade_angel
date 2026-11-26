@@ -4823,6 +4823,21 @@ class TargetMonitor:
                     )
                     curr = self.fetcher.get_option_premium(
                         sig.index_key, sig.strike, sig.direction, sig.expiry, side="ltp")
+                    if curr <= 0:
+                        # EOD emergency fallback: stale collector ticks must never trap an intraday exit
+                        q = self.fetcher.get_option_quote(
+                            sig.index_key, sig.strike, sig.direction, sig.expiry
+                        )
+                        stale_ltp = float(q.get("ltp") or 0.0)
+                        if math.isfinite(stale_ltp) and stale_ltp > 0:
+                            _log.warning(
+                                "Force-close using last-known LTP ₹%.2f (age=%ss, reason=%s) for %s",
+                                stale_ltp,
+                                round(q["snapshot_age_s"], 1) if q.get("snapshot_age_s") is not None else "?",
+                                q.get("reason"),
+                                sig.signal_id,
+                            )
+                            curr = stale_ltp
                 if curr <= 0:
                     _log.error(
                         "Force-close blocked: no validated bid or ltp for %s; will retry",

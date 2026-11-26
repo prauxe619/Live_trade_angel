@@ -4,6 +4,10 @@ import re
 import time
 from scipy.stats import norm
 
+_SQRT2 = math.sqrt(2.0)
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / _SQRT2))
 
 def _positive(value):
     try:
@@ -196,8 +200,8 @@ def _bs(spot, strike, t, rate, vol, is_call):
     d1 = (math.log(spot / strike) + (rate + 0.5 * vol * vol) * t) / sd
     d2 = d1 - sd
     if is_call:
-        return spot * norm.cdf(d1) - strike * math.exp(-rate * t) * norm.cdf(d2)
-    return strike * math.exp(-rate * t) * norm.cdf(-d2) - spot * norm.cdf(-d1)
+        return spot * _norm_cdf(d1) - strike * math.exp(-rate * t) * _norm_cdf(d2)
+    return strike * math.exp(-rate * t) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
 
 
 def implied_vol(spot, strike, dte, price, otype, rate=0.065):
@@ -219,13 +223,16 @@ def implied_vol(spot, strike, dte, price, otype, rate=0.065):
             return 0.0
         if price > _bs(spot, strike, t, rate, hi, is_call) + 0.5:
             return 0.0
-        for _ in range(80):
-            mid = (lo + hi) / 2.0
-            if _bs(spot, strike, t, rate, mid, is_call) < price:
+        for _ in range(40):
+            mid = (lo + hi) * 0.5
+            model_price = _bs(spot, strike, t, rate, mid, is_call)
+            if abs(model_price - price) < 1e-3 or (hi - lo) < 1e-4:
+                return mid if 0.01 <= mid <= 5.0 and math.isfinite(mid) else 0.0
+            if model_price < price:
                 lo = mid
             else:
                 hi = mid
-        result = (lo + hi) / 2.0
+        result = (lo + hi) * 0.5
         return result if 0.01 <= result <= 5.0 and math.isfinite(result) else 0.0
     except (ValueError, TypeError, OverflowError, ZeroDivisionError):
         return 0.0

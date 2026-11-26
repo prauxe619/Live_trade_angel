@@ -22,7 +22,6 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from datetime import datetime, date
-from scipy.stats import norm
 from SmartApi import SmartConnect
 from revenue_agent.telegram_vip_alert import send_telegram_message
 from dotenv import load_dotenv
@@ -80,7 +79,8 @@ CONFIG = {
     # Option Chain Scope
     "STRIKE_STEP"     : 50,
     "ATM_RANGE"       : 12,       # +-12 strikes = 25 strikes per expiry
-    "NUM_EXPIRIES"    : 3,        # weekly + next 2
+    "NUM_EXPIRIES"    : 2,        # weekly + next
+    "OFFSET_SEC"      : 0,        # wake at :00 each minute
 
     # Finance
     "RISK_FREE_RATE"  : 0.065,    # RBI repo rate proxy
@@ -103,6 +103,15 @@ CONFIG = {
     "IV_SKEW_WINGS"   : 3,        # +-3 strikes from ATM for skew calculation
     "IV_HISTORY_BARS" : 20,       # bars to track IV trend
 }
+
+_SQRT2 = math.sqrt(2.0)
+_INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / _SQRT2))
+
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) * _INV_SQRT_2PI
 
 logging.basicConfig(
     level=logging.INFO,
@@ -391,8 +400,8 @@ class InstitutionalCollector:
               (rate + 0.5 * volatility * volatility) * t) / (volatility * sqrt_t)
         d2 = d1 - volatility * sqrt_t
         if otype == "CE":
-            return spot * norm.cdf(d1) - strike * math.exp(-rate * t) * norm.cdf(d2)
-        return strike * math.exp(-rate * t) * norm.cdf(-d2) - spot * norm.cdf(-d1)
+            return spot * _norm_cdf(d1) - strike * math.exp(-rate * t) * _norm_cdf(d2)
+        return strike * math.exp(-rate * t) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
 
     def estimate_implied_volatility(self, spot: float, strike: float, dte: float,
                                     option_price: float, otype: str) -> float:
@@ -414,9 +423,11 @@ class InstitutionalCollector:
             high_price = self._bs_option_price(spot, strike, t, rate, high, otype)
             if option_price < low_price - 0.5 or option_price > high_price + 0.5:
                 return 0.0
-            for _ in range(80):
-                mid = (low + high) / 2.0
+            for _ in range(40):
+                mid = (low + high) * 0.5
                 model_price = self._bs_option_price(spot, strike, t, rate, mid, otype)
+                if abs(model_price - option_price) < 1e-3 or (high - low) < 1e-4:
+                    return float(mid)
                 if model_price < option_price:
                     low = mid
                 else:
@@ -460,10 +471,10 @@ class InstitutionalCollector:
             d1 = (log_moneyness + (r + 0.5 * iv ** 2) * t) / (iv * sqt)
             d2 = d1 - iv * sqt
 
-            Nd1  = norm.cdf(d1)
-            Nd2  = norm.cdf(d2)
-            Nd2_ = norm.cdf(-d2)
-            nd1  = norm.pdf(d1)
+            Nd1  = _norm_cdf(d1)
+            Nd2  = _norm_cdf(d2)
+            Nd2_ = _norm_cdf(-d2)
+            nd1  = _norm_pdf(d1)
 
             # -- Standard Greeks -----------------------------------------
             gamma = nd1 / (spot * iv * sqt)
@@ -979,18 +990,10 @@ class InstitutionalCollector:
                 "regime"            : regime,
                 "candles_fresh": candles_fresh,
                 
-                "candle_quality": (
-                    "angelone_websocket_ohlc"
-                    if candles_fresh
-                    else "unavailable"
-                ),
-                
                 "candle_quality_status": candle_quality_status,
                 
                 "candle_count": len(formatted_candles),
-                
-                "latest_candle_age_s": latest_candle_age_s,
-                
+                                
                 "trading_data_eligible": candles_fresh,
 
                 "data"         : batch,
@@ -998,7 +1001,6 @@ class InstitutionalCollector:
                 "spot_samples" : spot_samples,
                 "candle_quality": "angelone_websocket_ohlc" if candles_fresh else "unavailable",
                 "latest_candle_age_s": latest_candle_age_s,
-                "candles_fresh": candles_fresh,
                 "iv_method"     : "black_scholes_bisection_from_option_price",
                 "gex_method"    : "current_snapshot_strike_aggregation",
             }
@@ -1355,8 +1357,13 @@ class InstitutionalCollector:
                     )
 
                 # -- Precise minute alignment ---------------------------------
-                time.sleep(max(0, 60 - (now.second + now.microsecond / 1e6)))
-                ts = datetime.now(CONFIG["TZ"]).replace(second=0, microsecond=0)
+                # -- Staggered minute alignment --------------------------------
+                _now = datetime.now(CONFIG["TZ"])
+                wait_s = (CONFIG["OFFSET_SEC"] - (_now.second + _now.microsecond / 1e6)) % 60
+                if wait_s < 1.0:
+                    wait_s += 60.0
+                time.sleep(wait_s)
+                ts = datetime.now(CONFIG["TZ"]).replace(microsecond=0)
 
                 # Re-check close AFTER the alignment sleep so no extra tick
                 # is collected at/after MARKET_CLOSE.
@@ -1399,17 +1406,20 @@ class InstitutionalCollector:
 
                     # -- VIX: refresh before calculating volatility features --
                     if vix_token:
-                        v_data = self._call(self.api.ltpData, "NSE", "INDIA VIX", vix_token)
-                        time.sleep(0.4)
-                        if v_data.get("status") and isinstance(v_data.get("data"), dict):
-                            vix_value = safe_number(
-                                self._safe_val(v_data["data"], ["ltp", "lastPrice"], 0), 0.0
-                            )
-                            if vix_value > 0:
-                                self.last_vix = vix_value
-                                self.last_vix_timestamp = datetime.now(CONFIG["TZ"])
-                            else:
-                                logger.warning("[NIFTY] Invalid India VIX value; retaining last valid value.")
+                        try:
+                            v_data = self._call(self.api.ltpData, "NSE", "INDIA VIX", vix_token)
+                            time.sleep(0.4)
+                            if v_data.get("status") and isinstance(v_data.get("data"), dict):
+                                vix_value = safe_number(
+                                    self._safe_val(v_data["data"], ["ltp", "lastPrice"], 0), 0.0
+                                )
+                                if vix_value > 0:
+                                    self.last_vix = vix_value
+                                    self.last_vix_timestamp = datetime.now(CONFIG["TZ"])
+                                else:
+                                    logger.warning("[NIFTY] Invalid India VIX value; retaining last valid value.")
+                        except Exception as vix_exc:
+                            logger.warning("[NIFTY] India VIX refresh failed; continuing without a fresh VIX: %s", vix_exc)
 
                     # ── Realized Vol ──────────────────────────────────────
                     if len(self.spot_history) >= 2:
@@ -1552,6 +1562,8 @@ class InstitutionalCollector:
                             continue
 
                         dte = (exp - ts.date()).days
+                        tok_to_strike = dict(zip(batch_nfo["token"].astype(str), batch_nfo["strike"]))
+                        sym_to_strike = dict(zip(batch_nfo["symbol"], batch_nfo["strike"]))
 
                         for item in fetched_items:
                             # --- PERMANENT FIX: Match tokens definitively ---
@@ -1559,17 +1571,13 @@ class InstitutionalCollector:
                             tok = str(item.get('symbolToken', ''))
                             
                             # Bulletproof matching by token ID
-                            match = batch_nfo[batch_nfo['token'].astype(str) == tok]
-                            
-                            # Fallback to string match if token is somehow missing
-                            if match.empty:
-                                match = batch_nfo[batch_nfo['symbol'] == sym]
-                                
-                            if match.empty:
+                            strike = tok_to_strike.get(tok)
+                            if strike is None:
+                                strike = sym_to_strike.get(sym)
+                            if strike is None:
                                 logger.warning(f"DEBUG_SKIP: {sym} (tok: {tok}) not found in batch")
                                 continue
-
-                            strike = float(match['strike'].iloc[0])
+                            strike = float(strike)
                             otype  = "CE" if sym.endswith("CE") else "PE"
 
                             oi_key = (sym, str(exp), strike, otype)
@@ -1579,66 +1587,11 @@ class InstitutionalCollector:
                             volume = safe_number(
                                 self._safe_val(item, ['tradeVolume', 'tradedVolume', 'volume'], 0)
                             )
-                            bid = self._safe_val(item, ['bidPrice', 'bestBid'], 0) or 0
-                            ask = self._safe_val(item, ['askPrice', 'bestAsk'], 0) or 0
-                            # Normalize direct fields before testing truthiness (e.g. "0" is truthy).
-                            try:
-                                bid = float(bid)
-                                if not math.isfinite(bid) or bid <= 0:
-                                    bid = 0.0
-                            except (TypeError, ValueError, OverflowError):
-                                bid = 0.0
-                            try:
-                                ask = float(ask)
-                                if not math.isfinite(ask) or ask <= 0:
-                                    ask = 0.0
-                            except (TypeError, ValueError, OverflowError):
-                                ask = 0.0
-
-                            depth = item.get('depth', {})
-                            buy_levels = depth.get('buy', []) if isinstance(depth, dict) else []
-                            sell_levels = depth.get('sell', []) if isinstance(depth, dict) else []
-
-                            def get_price(level):
-                                if not isinstance(level, dict):
-                                    return 0.0
-                                for key in ('price', 'buyPrice', 'sellPrice', 'bestPrice', 'rate'):
-                                    try:
-                                        value = float(level.get(key, 0) or 0)
-                                        if math.isfinite(value) and value > 0:
-                                            return value
-                                    except (TypeError, ValueError, OverflowError):
-                                        continue
-                                return 0.0
-
-                            def get_qty(level):
-                                for key in ('quantity', 'qty', 'totalQuantity', 'totalQty', 'volume'):
-                                    try:
-                                        value = float(level.get(key, 0) or 0)
-                                        if value > 0:
-                                            return value
-                                    except (TypeError, ValueError):
-                                        pass
-                                return 0
+                            
 
                             # Preserve the exchange timestamps for later freshness audits.
                             exchange_feed_time = item.get('exchFeedTime')
                             exchange_trade_time = item.get('exchTradeTime')
-
-                            # Search all available depth levels instead of assuming level 1 is valid.
-                            if not bid:
-                                for level in buy_levels:
-                                    candidate = get_price(level)
-                                    if candidate > 0:
-                                        bid = candidate
-                                        break
-
-                            if not ask:
-                                for level in sell_levels:
-                                    candidate = get_price(level)
-                                    if candidate > 0:
-                                        ask = candidate
-                                        break
 
                             # Shared parser is the single source of truth for all four indices.
                             quote = parse_quote(
@@ -1663,26 +1616,17 @@ class InstitutionalCollector:
                             if quote_entry_eligible:
                                 option_price = (bid + ask) / 2.0
                                 iv_price_source = "mid"
+                                iv_used = self.estimate_implied_volatility(
+                                    self.last_spot, strike, dte, option_price, otype
+                                )
+                                iv_solution_valid = bool(iv_used > 0 and math.isfinite(iv_used))
+                                iv_valid = iv_solution_valid
                             else:
-                                try:
-                                    option_price = float(ltp or 0)
-                                    if not math.isfinite(option_price) or option_price <= 0:
-                                        option_price = 0.0
-                                except (TypeError, ValueError, OverflowError):
-                                    option_price = 0.0
-                                iv_price_source = "ltp_fallback"
-
-                            iv_used = self.estimate_implied_volatility(
-                                self.last_spot, strike, dte, option_price, otype
-                            )
-                            iv_solution_valid = bool(
-                                iv_used > 0 and math.isfinite(iv_used)
-                            )
-                            iv_valid = bool(
-                                quote_entry_eligible
-                                and iv_price_source == "mid"
-                                and iv_solution_valid
-                            )
+                                option_price = 0.0
+                                iv_price_source = "unavailable"
+                                iv_used = 0.0
+                                iv_solution_valid = False
+                                iv_valid = False
 
                             prev_oi_val  = self.prev_oi.get(oi_key, oi)
                             prev_ltp_val = self.prev_ltp.get(oi_key, ltp)
@@ -1821,6 +1765,7 @@ class InstitutionalCollector:
                         current_batch, aggregates, iv_surface, gex_walls,
                         futures_basis=futures_basis,
                         futures_basis_pct=futures_basis_pct,
+                        futures_basis_valid=futures_basis_valid,
                         realized_vol=rv,
                         iv_rv_spread=iv_rv_spread,
                         vix_fresh=vix_fresh,
@@ -1837,7 +1782,7 @@ class InstitutionalCollector:
                         logger.info(
                             f"{ts.strftime('%H:%M')} | "
                             f"Spot: {self.last_spot:.0f} | "
-                            f"VIX: {self.last_vix:.1f} | "
+                            f"VIX: {f'{self.last_vix:.1f}' if self.last_vix is not None else 'N/A'} | "
                             f"ATM IV: {iv_surface.get('atm_iv', 0):.3f} | "
                             f"Net GEX: {aggregates.get('raw_net_gex', 0):.0f} | "
                             f"Pin: {gex_walls.get('pin_strike', 0):.0f}"
