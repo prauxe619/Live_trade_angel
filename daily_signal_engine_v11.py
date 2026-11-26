@@ -812,21 +812,21 @@ LIVE_SNAPSHOT_MAX_AGE_S  = max(1, int(os.getenv("LIVE_SNAPSHOT_MAX_AGE_SECONDS",
 
 # ── Scan schedule (HH:MM IST) ─────────────────────────────────────────────────
 SCANS = {
-    "pre_market":  "09:09",
+    "pre_market":  "09:11",   # Ensures NSE pre-open equilibrium spot has settled
     "swing_close": "09:25",
 
-    # Prime Window 1: Opening Range Breakout & Morning Trend
-    "scan_935":    "09:35",   # Catches 15-min ORB (09:15-09:30) 10 mins earlier than 09:45
-    "scan_1005":   "10:05",   # Morning trend confirmation
-    "scan_1045":   "10:45",   # Trend continuation / VWAP bounce
+    # Prime Window 1: Opening Range Breakout & Morning Trend (+1 min candle-commit buffer)
+    "scan_936":    "09:36",   # 09:30–09:35 bar committed + 20 bars ready for session VWAP
+    "scan_1006":   "10:06",   # 10:00–10:05 bar committed
+    "scan_1046":   "10:46",   # 10:40–10:45 bar committed
 
-    # Prime Window 2: Afternoon Institutional Flow & 0DTE Gamma
-    "scan_1335":   "13:35",   # European overlap & afternoon volume return
-    "scan_1400":   "14:00",   # Primary afternoon breakout / 0DTE push
-    "scan_1430":   "14:30",   # Final high-conviction entry cutoff
+    # Prime Window 2: Afternoon Institutional Flow & 0DTE Gamma (+1 min candle-commit buffer)
+    "scan_1336":   "13:36",   # Post-European-open 13:30–13:35 bar committed
+    "scan_1401":   "14:01",   # 13:55–14:00 bar committed
+    "scan_1431":   "14:31",   # 14:25–14:30 bar committed (final entry scan)
 
     "pre_close":   "14:45",
-    "force_close": "15:25",
+    "force_close": "15:12",   # Exits ahead of 15:15 CAS freeze & broker MIS square-offs
     "eod":         "15:30",
 }
 
@@ -904,8 +904,8 @@ async def _async_tq_worker():
 
 
 def _is_valid_entry_window(now_hm: str) -> bool:
-    """Matches your Prime Window 1 (09:35-10:45) and Prime Window 2 (13:35-14:30)."""
-    return ("09:30" <= now_hm <= "11:05") or ("13:35" <= now_hm <= "14:35")
+    """Matches Prime Window 1 (09:36-10:46) and Prime Window 2 (13:36-14:31)."""
+    return ("09:35" <= now_hm <= "11:05") or ("13:36" <= now_hm <= "14:35")
 
 def _effective_prob_threshold(index_key: str, is_live: bool = False) -> float:
     """
@@ -5860,6 +5860,8 @@ class DailySignalEngine:
                 # 🔥 REVERSAL FIX: Accept lowered threshold if it is a reversal flip
                 # ── VIP: Sniper ───────────────────────────────────────────────
                 # 🔥 REVERSAL FIX: Reversals bypass 90m fresh-entry cooldown (already gated by 15m hold & 30m rev cooldown)
+                # ── VIP: Sniper ───────────────────────────────────────────────
+                # 🔥 REVERSAL FIX: Reversals bypass 90m fresh-entry cooldown (already gated by 15m hold & 30m rev cooldown)
                 if sniper["active"] and not sniper_blocked \
                     and (self._sniper_cooldown_ok(idx_key) or is_reversal) \
                     and (abs(analysis["prob"]) >= min_required_prob or (is_reversal and abs(analysis["prob"]) >= (min_required_prob - 0.05))):
@@ -6750,38 +6752,38 @@ class DailySignalEngine:
                     self.monitor.force_close_swing()
                     self._fired.add("swing_close")
 
-                elif now >= SCANS["scan_935"] and "scan_935" not in self._fired:
-                    self.run_scan("09:35 Opening Range Breakout")
-                    self._fired.add("scan_935")
+                elif now >= SCANS["scan_936"] and "scan_936" not in self._fired:
+                    self.run_scan("09:36 Opening Range Breakout")
+                    self._fired.add("scan_936")
 
-                elif now >= SCANS["scan_1005"] and "scan_1005" not in self._fired:
-                    self.run_scan("10:05 Morning Trend Confirmation")
+                elif now >= SCANS["scan_1006"] and "scan_1006" not in self._fired:
+                    self.run_scan("10:06 Morning Trend Confirmation")
                     self._do_mid_morning_free()
-                    self._fired.add("scan_1005")
+                    self._fired.add("scan_1006")
 
-                elif now >= SCANS["scan_1045"] and "scan_1045" not in self._fired:
-                    self.run_scan("10:45 Trend Continuation / VWAP Bounce")
-                    self._fired.add("scan_1045")
+                elif now >= SCANS["scan_1046"] and "scan_1046" not in self._fired:
+                    self.run_scan("10:46 Trend Continuation / VWAP Bounce")
+                    self._fired.add("scan_1046")
 
-                elif now >= SCANS["scan_1335"] and "scan_1335" not in self._fired:
-                    self.run_scan("13:35 Afternoon Activity")
-                    self._fired.add("scan_1335")
+                elif now >= SCANS["scan_1336"] and "scan_1336" not in self._fired:
+                    self.run_scan("13:36 Afternoon Activity")
+                    self._fired.add("scan_1336")
 
-                elif now >= SCANS["scan_1400"] and "scan_1400" not in self._fired:
-                    self.run_scan("14:00 Afternoon Trend")
+                elif now >= SCANS["scan_1401"] and "scan_1401" not in self._fired:
+                    self.run_scan("14:01 Afternoon Trend")
                     self._do_afternoon_free()
-                    self._fired.add("scan_1400")
+                    self._fired.add("scan_1401")
 
-                elif now >= SCANS["scan_1430"] and "scan_1430" not in self._fired:
-                    self.run_scan("14:30 Final Entry Opportunity")
-                    self._fired.add("scan_1430")
+                elif now >= SCANS["scan_1431"] and "scan_1431" not in self._fired:
+                    self.run_scan("14:31 Final Entry Opportunity")
+                    self._fired.add("scan_1431")
 
                 elif now >= SCANS["pre_close"] and "pre_close" not in self._fired:
                     self._do_pre_close_free()
                     self._fired.add("pre_close")
 
                 elif now >= SCANS["force_close"] and "force_close" not in self._fired:
-                    _log.info("⏰ 15:25 — Force closing all intraday positions.")
+                    _log.info("⏰ 15:12 — Force closing all intraday positions.")
                     self.monitor.force_close_intraday()
                     self._fired.add("force_close")
 
@@ -6789,7 +6791,7 @@ class DailySignalEngine:
                     self._do_eod()
                     self._fired.add("eod")
 
-                elif self._is_market_hours() and "scan_935" in self._fired:
+                elif self._is_market_hours() and "scan_936" in self._fired:
                     # Between scheduled scans: continuous live monitoring
                     self._live_breakout_check()
                     self._live_sniper_check()
