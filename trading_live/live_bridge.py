@@ -21,6 +21,7 @@ from .broker_reconciliation import (
     AngelOneReadOnlySnapshotAdapter,
     ReadOnlyReconciliationCoordinator,
 )
+from trading_live.broker_reconciliation import InstrumentMasterIndex
 
 log = logging.getLogger("black.live")
 IST = ZoneInfo("Asia/Kolkata")
