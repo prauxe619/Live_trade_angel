@@ -288,6 +288,45 @@ def _calculate_futures_session_vwap(futures_rows):
         result["reason"] = "calculation_exception"
         return result
 
+def apply_dual_vwap_gate(
+    signal_type: str,
+    spot_price: float,
+    rolling_vwap: float,
+    session_vwap: Optional[float],
+    base_prob: float,
+    futures_valid_bars: int = 20
+) -> tuple[float, bool, str]:
+    """
+    Dual-Anchor VWAP Probability Adjuster & Gate with Fallback.
+    """
+    if session_vwap is None or session_vwap <= 0 or futures_valid_bars < 15:
+        return base_prob, True, "session_vwap_fallback_warming_up"
+
+    rolling_dir = "BULLISH" if spot_price > rolling_vwap else "BEARISH"
+    session_dir = "BULLISH" if spot_price > session_vwap else "BEARISH"
+    
+    agreed = (rolling_dir == session_dir)
+    signal_bias = "BULLISH" if signal_type == "CE" else "BEARISH"
+    
+    adjusted_prob = base_prob
+    reason = "vwap_neutral"
+
+    if agreed:
+        if rolling_dir == signal_bias:
+            adjusted_prob = min(1.0, base_prob * 1.12)
+            reason = f"dual_vwap_agreement_boost_{rolling_dir.lower()}"
+        else:
+            adjusted_prob = base_prob * 0.70
+            reason = "dual_vwap_agreement_against_signal"
+    else:
+        if session_dir != signal_bias:
+            adjusted_prob = base_prob * 0.80
+            reason = "session_vwap_divergence_penalty"
+        else:
+            adjusted_prob = min(1.0, base_prob * 1.05)
+            reason = "session_vwap_aligned_rolling_divergence"
+
+    return adjusted_prob, True, reason
 
 def _persist_vwap_shadow_observation(
     symbol: str,
@@ -2822,7 +2861,22 @@ class TechnicalBrain:
         # Divisor = dominant indicator max (MACD 0.6 + MA 0.5 + RSI 0.3) = 1.4, rounded to 1.6
         # for headroom. Scores above 1.6 clip to 1.0 (extreme confluence = max conviction).
         _PROB_NORM = 1.6
-        prob    = float(np.clip(score / _PROB_NORM, -1.0, 1.0))
+        base_prob    = float(np.clip(score / _PROB_NORM, -1.0, 1.0))
+        
+        # ── ACTIVE DUAL-ANCHOR VWAP INTEGRATION ──────────────────────────────
+        raw_direction = "CE" if base_prob > 0 else "PE"
+        session_vwap_val = vwap_shadow.get("vwap") if shadow_valid else None
+        valid_bars_val = vwap_shadow.get("valid_bar_count", 20) if shadow_valid else 0
+
+        prob, _, vwap_gate_reason = apply_dual_vwap_gate(
+            signal_type=raw_direction,
+            spot_price=spot,
+            rolling_vwap=rolling_vwap,
+            session_vwap=session_vwap_val,
+            base_prob=base_prob,
+            futures_valid_bars=valid_bars_val
+        )
+        
         is_chop = bb_w < 0.015 and abs(prob) < CHOP_PROB_CEILING
 
         if is_chop:          regime = "CHOP"
