@@ -714,6 +714,7 @@ class LiveBridge:
         pos.update(status="SUBMITTING", entry_limit=limit, sl_planned=sl_price)
         intent_id = None
         try:
+            self._validate_account_reconciliation(index_key=pos.get("index"))
             from . import order_manager as om
             update_intent = om.update_intent
             claim = getattr(om, "claim_entry_intent", None)
@@ -750,8 +751,7 @@ class LiveBridge:
                     self._save(pos)
                     self._alert(f"ENTRY BLOCKED: existing broker exposure/order for {contract['tradingsymbol']}")
                     return pos
-            # Account-wide exact position/order reconciliation.
-            self._validate_account_reconciliation(index_key=pos.get("index"))
+            # Account-wide exact position/order reconciliation.            
             oid = self.broker.place_order(payload)
         except OrderOutcomeUnknown as e:
             if intent_id:
