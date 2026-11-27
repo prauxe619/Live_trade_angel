@@ -18,6 +18,7 @@ import math
 import os
 import threading
 import time
+import requests
 
 log = logging.getLogger("black.broker")
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -633,7 +634,20 @@ class AngelOneBroker:
                 )
     
             try:
-                response = self._call("orderBook")
+                response = None
+                for attempt in range(2):
+                    try:
+                        response = self._call("orderBook")
+                        break
+                    except (requests.exceptions.ConnectionError, ConnectionResetError) as net_exc:
+                        if attempt == 0:
+                            log.warning(
+                                "Angel One orderBook socket reset (%s); retrying once",
+                                net_exc,
+                            )
+                            time.sleep(0.25)
+                            continue
+                        raise
     
                 if (
                     not isinstance(response, dict)
