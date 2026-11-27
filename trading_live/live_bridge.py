@@ -10,7 +10,7 @@ Design rules
   * Default is SHADOW mode (LIVE_SHADOW=true): everything runs and is logged, no order is sent.
 """
 from __future__ import annotations
-import os, json, math, time, hashlib, logging, threading, urllib.request, urllib.parse
+import os, re, json, math, time, hashlib, logging, threading, urllib.request, urllib.parse
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from .lot_config import configured_live_lots
@@ -19,9 +19,9 @@ from .angel_one_broker import (AngelOneBroker, BrokerSafetyError, OrderOutcomeUn
 from .live_state import MemoryStore, PgStore, list_active, today_ist
 from .broker_reconciliation import (
     AngelOneReadOnlySnapshotAdapter,
+    InstrumentMasterIndex,
     ReadOnlyReconciliationCoordinator,
 )
-from trading_live.broker_reconciliation import InstrumentMasterIndex
 
 log = logging.getLogger("black.live")
 IST = ZoneInfo("Asia/Kolkata")
@@ -305,7 +305,15 @@ class LiveBridge:
         except BrokerSafetyError:
             return info
 
-    def _validate_pretrade_risk(self, *, signal_id, quantity, lot_size, snapshot_age_s, entry_price, stop_price):
+    @staticmethod
+    def _contract_key_matches_index(key: str, index_key: str) -> bool:
+        k = str(key or "").upper()
+        idx = str(index_key or "").strip().upper()
+        if not idx:
+            return True
+        return bool(re.search(rf"(?:^|[:|/\s_-]){re.escape(idx)}\d", k))
+
+    def _validate_pretrade_risk(self, *, signal_id, index_key, quantity, lot_size, snapshot_age_s, entry_price, stop_price):
         """Apply risk limits immediately before any live BUY."""
         if self.risk_check is not None:
             result = self.risk_check(
@@ -345,7 +353,22 @@ class LiveBridge:
                 key = (exchange, token, symbol)
                 net_by_contract[key] = net_by_contract.get(key, 0) + int(numeric_qty)
             broker_open_positions = sum(1 for qty in net_by_contract.values() if qty != 0)
-            if broker_open_positions != len(active):
+            allow_other_manual = os.getenv("LIVE_ALLOW_MANUAL_OTHER_INDICES", "false").strip().lower() == "true"
+            if allow_other_manual:
+                idx_broker_open = sum(
+                    1 for (_ex, _tok, sym), qty in net_by_contract.items()
+                    if qty != 0 and self._contract_key_matches_index(sym, index_key)
+                )
+                idx_bot_active = sum(
+                    1 for p in active
+                    if str(p.get("index") or "").strip().upper() == str(index_key).strip().upper()
+                )
+                if idx_broker_open != idx_bot_active:
+                    raise BrokerSafetyError(
+                        f"Broker derivative positions for {index_key} do not match bot-managed live positions; "
+                        "unmanaged/manual exposure on this index detected"
+                    )
+            elif broker_open_positions != len(active):
                 raise BrokerSafetyError(
                     "Broker derivative positions do not match bot-managed live positions; "
                     "unmanaged/manual exposure or unresolved reconciliation detected"
@@ -403,7 +426,7 @@ class LiveBridge:
         return {"approved": True, "limits": order_check, "money": money_check,
                 "available_cash": available_cash}
      
-    def _validate_account_reconciliation(self):
+    def _validate_account_reconciliation(self, index_key: str | None = None):
         """
         Block new BUY orders unless the entire broker account
         is reconciled against bot-managed positions and orders.
@@ -456,11 +479,16 @@ class LiveBridge:
                 )
 
             # Only explicitly unchanged positions are safe.
-            blocked = [
-                result
-                for result in results
-                if getattr(result, "decision", None) != "UNCHANGED"
-            ]
+            allow_other_manual = os.getenv("LIVE_ALLOW_MANUAL_OTHER_INDICES", "false").strip().lower() == "true"
+            blocked = []
+            for result in results:
+                if getattr(result, "decision", None) == "UNCHANGED":
+                    continue
+                ckey = str(getattr(result, "contract_key", "") or "").upper()
+                if not allow_other_manual or not index_key or ckey in {"ACCOUNT", "INVALID-ENGINE-CONTRACT"}:
+                    blocked.append(result)
+                elif self._contract_key_matches_index(ckey, index_key):
+                    blocked.append(result)
 
             if blocked:
                 reasons = "; ".join(
@@ -651,7 +679,7 @@ class LiveBridge:
 
                 if not self.cfg.shadow:
                     pos["pretrade_risk"] = self._validate_pretrade_risk(
-                        signal_id=sid, quantity=qty, lot_size=lot,
+                        signal_id=sid, index_key=index_key, quantity=qty, lot_size=lot,
                         snapshot_age_s=snapshot_age, entry_price=worst_entry_price,
                         stop_price=sl_price,
                     )
@@ -723,7 +751,7 @@ class LiveBridge:
                     self._alert(f"ENTRY BLOCKED: existing broker exposure/order for {contract['tradingsymbol']}")
                     return pos
             # Account-wide exact position/order reconciliation.
-            self._validate_account_reconciliation()
+            self._validate_account_reconciliation(index_key=pos.get("index"))
             oid = self.broker.place_order(payload)
         except OrderOutcomeUnknown as e:
             if intent_id:
